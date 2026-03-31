@@ -1,0 +1,11 @@
+-- ===================================================================
+-- Serving projection validation query notes
+-- ===================================================================
+-- In v1, publication copies the build database to a serving database,
+-- then relies on the pre-created serving views already present in the DB.
+--
+-- This file exists as a placeholder to make the publication contract
+-- explicit and to reserve a dedicated location for future release-time
+-- projection SQL if we later decide to slim the serving DB further.
+-- ===================================================================
+SELECT 1 AS publication_contract_placeholder;

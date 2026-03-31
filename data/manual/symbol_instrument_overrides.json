@@ -1,0 +1,72 @@
+[
+  {
+    "symbol_normalized": "AACBR",
+    "source_family": null,
+    "source_symbol_native": null,
+    "instrument_type": "RIGHT",
+    "security_family": "DERIVATIVE_LIKE",
+    "market_code": "US",
+    "exchange_code": null,
+    "listing_venue_bucket": null,
+    "effective_from": null,
+    "effective_to": null,
+    "priority": 100,
+    "notes": "Manual override for rights security."
+  },
+  {
+    "symbol_normalized": "AACBU",
+    "source_family": null,
+    "source_symbol_native": null,
+    "instrument_type": "UNIT",
+    "security_family": "STRUCTURED_PRODUCT",
+    "market_code": "US",
+    "exchange_code": null,
+    "listing_venue_bucket": null,
+    "effective_from": null,
+    "effective_to": null,
+    "priority": 100,
+    "notes": "Manual override for unit security."
+  },
+  {
+    "symbol_normalized": "AACIW",
+    "source_family": null,
+    "source_symbol_native": null,
+    "instrument_type": "WARRANT",
+    "security_family": "DERIVATIVE_LIKE",
+    "market_code": "US",
+    "exchange_code": null,
+    "listing_venue_bucket": null,
+    "effective_from": null,
+    "effective_to": null,
+    "priority": 100,
+    "notes": "Manual override for warrant security."
+  },
+  {
+    "symbol_normalized": "AAAA",
+    "source_family": "yfinance",
+    "source_symbol_native": "AAAA",
+    "instrument_type": "ETF",
+    "security_family": "FUND",
+    "market_code": "US",
+    "exchange_code": "NYSE",
+    "listing_venue_bucket": null,
+    "effective_from": null,
+    "effective_to": null,
+    "priority": 110,
+    "notes": "Manual override from Nasdaq symbol directory: ETF=Y, security name indicates ETF."
+  },
+  {
+    "symbol_normalized": "AACI",
+    "source_family": "yfinance",
+    "source_symbol_native": "AACI",
+    "instrument_type": "COMMON_STOCK",
+    "security_family": "EQUITY",
+    "market_code": "US",
+    "exchange_code": "NASDAQ",
+    "listing_venue_bucket": null,
+    "effective_from": null,
+    "effective_to": null,
+    "priority": 110,
+    "notes": "Manual override from Nasdaq symbol directory: Class A Ordinary Share, ETF=N."
+  }
+]

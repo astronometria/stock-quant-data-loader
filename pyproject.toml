@@ -9,16 +9,15 @@ description = "SQL-first market data loader and normalization build pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "fastapi>=0.111.0",
-  "uvicorn>=0.30.0",
-  "duckdb>=1.0.0",
-  "pydantic>=2.7.0",
-  "pydantic-settings>=2.2.1",
-  "tqdm>=4.66.0",
+    "duckdb>=1.0.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.1",
+    "tqdm>=4.66.0",
+    "pytz>=2024.1",
 ]
 
 [project.scripts]
-sq = "stock_quant_data.cli.main:main"
+sqload = "stock_quant_data.cli.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

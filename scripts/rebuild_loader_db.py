@@ -7,6 +7,7 @@ Design goals:
 - keep SQL-first where possible
 - continue after failures so the operator gets a full failure map
 - run explicit invariant checks so master-data corruption is caught quickly
+- do NOT create automatic backup files
 
 Important runtime rule:
 - this script bootstraps the repo-local src/ path itself
@@ -17,18 +18,17 @@ from __future__ import annotations
 
 import importlib
 import json
-import shutil
 import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 
 # ----------------------------------------------------------------------
 # Make repo-local package imports deterministic.
-#
 # Why:
 # - the user's shell may not have the repo venv activated
 # - editable install may not be active in the current interpreter
@@ -49,12 +49,16 @@ class StepResult:
 
 
 def _print_json(payload: object) -> None:
+    """Pretty-print JSON payloads with deterministic formatting."""
     print(json.dumps(payload, indent=2, default=str))
 
 
 def _load_run(module_name: str):
     """
     Dynamically import a loader job module and return its run() function.
+
+    We keep the orchestration layer intentionally thin:
+    each step is just a Python module exposing run().
     """
     module = importlib.import_module(module_name)
     run_fn = getattr(module, "run", None)
@@ -63,21 +67,15 @@ def _load_run(module_name: str):
     return run_fn
 
 
-def _backup_and_reset_db() -> None:
+def _reset_db_without_backup() -> None:
     """
-    Backup the current mutable build DB, then remove it so the rebuild is deterministic.
+    Remove the mutable build DB and WAL so the rebuild starts from a clean state.
+
+    Important:
+    - no backup files are created here
+    - the caller is explicitly choosing a full clean rebuild
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    if DB_PATH.exists():
-        backup_path = DB_PATH.with_suffix(DB_PATH.suffix + ".bak")
-        shutil.copy2(DB_PATH, backup_path)
-        print(f"BACKUP_DB: {DB_PATH} -> {backup_path}")
-
-    if DB_WAL_PATH.exists():
-        wal_backup_path = DB_WAL_PATH.with_suffix(DB_WAL_PATH.suffix + ".bak")
-        shutil.copy2(DB_WAL_PATH, wal_backup_path)
-        print(f"BACKUP_WAL: {DB_WAL_PATH} -> {wal_backup_path}")
 
     if DB_PATH.exists():
         DB_PATH.unlink()
@@ -91,6 +89,9 @@ def _backup_and_reset_db() -> None:
 def _probe_required_tables() -> dict:
     """
     Return a status map for key tables expected in the build DB.
+
+    This is intentionally explicit so operators can immediately see whether the
+    canonical tables required by downstream steps exist and have rows.
     """
     from stock_quant_data.db.connections import connect_build_db
 
@@ -109,10 +110,11 @@ def _probe_required_tables() -> dict:
         "main.high_priority_unresolved_symbol_probe",
         "main.instrument",
         "main.symbol_reference_history",
+        "main.listing_status_history",
+        "main.price_history",
     ]
 
     probe: dict[str, dict] = {}
-
     conn = connect_build_db()
     try:
         for table_name in wanted:
@@ -134,6 +136,9 @@ def _probe_required_tables() -> dict:
 def _run_step(step_name: str, module_name: str) -> StepResult:
     """
     Execute one loader job and capture success/failure without stopping the rebuild.
+
+    This is useful operationally because one broken step should not hide the status
+    of the later steps and probes.
     """
     print(f"===== STEP: {step_name} =====")
     try:
@@ -155,6 +160,13 @@ def _run_step(step_name: str, module_name: str) -> StepResult:
 def main() -> None:
     """
     Full loader-native rebuild entrypoint.
+
+    Order matters:
+    - raw/source identity layers first
+    - reference/master reconstruction next
+    - price normalization after reference identity exists
+    - unresolved triage after normalization
+    - canonical price_history near the end
     """
     print("===== REBUILD LOADER DB =====")
     print(f"REPO_ROOT: {REPO_ROOT}")
@@ -163,7 +175,7 @@ def main() -> None:
     print(f"PYTHON_EXECUTABLE: {sys.executable}")
     print(f"SYS_PATH_HEAD: {sys.path[:5]}")
 
-    _backup_and_reset_db()
+    _reset_db_without_backup()
 
     step_results: list[StepResult] = []
 
@@ -193,6 +205,8 @@ def main() -> None:
         ("build_symbol_reference_candidates_from_unresolved_stooq_post_sec", "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq"),
         ("build_unresolved_symbol_worklist_post_sec", "stock_quant_data.jobs.build_unresolved_symbol_worklist"),
         ("build_high_priority_unresolved_symbol_probe", "stock_quant_data.jobs.build_high_priority_unresolved_symbol_probe"),
+        ("build_price_history_from_raw", "stock_quant_data.jobs.build_price_history_from_raw"),
+        ("check_master_data_invariants_final", "stock_quant_data.jobs.check_master_data_invariants"),
     ]
 
     for step_name, module_name in steps:

@@ -1,51 +1,53 @@
 # stock-quant-data-loader
 
-Plateforme de données de marché orientée **scientifique / PIT / survivor-bias aware**.
+Repo de **construction** de la base de données marché.
 
-## Objectif
+Ce repo est responsable de :
 
-Ce repo couvre uniquement la **partie 1** :
+- initialiser la build DB DuckDB
+- charger les tables raw locales produites par le downloader
+- construire les tables de référence (`instrument`, `symbol_reference_history`, `listing_status_history`)
+- construire les tables de normalisation prix
+- produire les tables de triage des symboles non résolus
+- construire la table canonique `price_history`
 
-- ingestion de données
-- normalisation canonique
-- reconstruction historique PIT
-- publication d'une release immuable de serving
-- exposition lecture seule via API
+Ce repo n'est **pas** responsable de :
 
-Ce repo **ne contient pas** :
+- télécharger les fichiers source depuis internet
+- exposer une API HTTP
+- exécuter des backtests, labels ML, features de recherche ou portefeuille
 
-- recherche alpha
-- features de recherche
-- labels ML
-- backtests
-- portefeuille
-- moteur de ranking
+## Tables principales côté build
 
-## Architecture
+### Raw
+- `nasdaq_symbol_directory_raw`
+- `sec_companyfacts_raw`
+- `sec_submissions_company_raw`
+- `price_source_daily_raw_stooq`
+- `price_source_daily_raw_yahoo`
 
-Deux plans physiques séparés :
+### Référence / master data
+- `instrument`
+- `symbol_reference_history`
+- `listing_status_history`
+- `symbol_manual_override_map`
+- `stooq_symbol_normalization_map`
 
-1. **Build plane**
-   - construit la vérité historique
-   - valide les invariants scientifiques
-   - prépare la publication
+### Triage / résolution
+- `price_source_daily_normalized`
+- `symbol_reference_candidates_from_unresolved_stooq`
+- `unresolved_symbol_worklist`
+- `high_priority_unresolved_symbol_probe`
 
-2. **Serve plane**
-   - lit seulement une release publiée
-   - lecture seule
-   - stable et reproductible
+### Canonique
+- `price_history`
 
-## Répertoires runtime
+## Runtime local
+- build DB : `data/build/market_build.duckdb`
 
-- `data/build/market_build.duckdb` : base de travail
-- `data/releases/<release_id>/serving.duckdb` : release publiée
-- `data/current` : lien symbolique vers la release active
-
-## Principes scientifiques
-
-- snapshots d'univers historisés
+## Principes
+- SQL-first
 - point-in-time
 - pas de survivor bias
-- publication immuable
-- API lecture seule
-- séparation stricte entre build et serving
+- invariants explicites après les étapes critiques
+- séparation stricte entre downloader, loader et api

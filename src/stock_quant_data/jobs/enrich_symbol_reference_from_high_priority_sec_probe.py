@@ -1,20 +1,18 @@
 """
-Repair / enrich symbol_reference_history from the high-priority SEC probe.
+Repair / enrich open-ended symbol references from SEC-backed high-priority probe
+rows.
 
-Current canonical input:
+Canonical source:
 - high_priority_unresolved_symbol_probe
+
+Canonical target tables:
 - instrument
 - symbol_reference_history
 
-Current behavior:
-- only processes rows where probe_recommendation = 'LIKELY_CREATE_REFERENCE_FROM_SEC'
-- if the instrument already exists in instrument.primary_ticker, repair the
-  open-ended symbol_reference_history row to the earliest observed unresolved
-  date from the probe
-- if the symbol is fully absent from instrument, create the instrument and add
-  an open-ended symbol_reference_history row
-
-This job intentionally does NOT touch format-mapping rows.
+Important:
+- only rows with probe_recommendation = 'LIKELY_CREATE_REFERENCE_FROM_SEC'
+- repair existing closed rows when possible
+- otherwise create missing open-ended row
 """
 
 from __future__ import annotations
@@ -29,33 +27,60 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Apply high-confidence SEC-based reference repairs/creations.
+    Promote SEC-likely probe rows into current open-ended reference rows.
     """
     configure_logging()
     LOGGER.info("enrich-symbol-reference-from-high-priority-sec-probe started")
 
     conn = connect_build_db()
     try:
-        conn.execute("DROP TABLE IF EXISTS tmp_sec_probe_rows")
+        conn.execute("DROP TABLE IF EXISTS tmp_hp_sec_probe")
         conn.execute(
             """
-            CREATE TEMP TABLE tmp_sec_probe_rows AS
+            CREATE TEMP TABLE tmp_hp_sec_probe AS
             SELECT
-                raw_symbol,
-                min_price_date,
-                COALESCE(NULLIF(exact_current_exchange, ''), 'UNKNOWN') AS exchange_name
+                raw_symbol AS symbol,
+                min_price_date AS effective_from,
+                CASE
+                    WHEN sec_exact_matches LIKE '% / Nasdaq%' THEN 'Nasdaq'
+                    WHEN sec_exact_matches LIKE '% / NASDAQ%' THEN 'NASDAQ'
+                    WHEN sec_exact_matches LIKE '% / NYSE%' THEN 'NYSE'
+                    ELSE 'UNKNOWN'
+                END AS exchange_name
             FROM high_priority_unresolved_symbol_probe
             WHERE probe_recommendation = 'LIKELY_CREATE_REFERENCE_FROM_SEC'
             """
         )
 
         staged_probe_row_count = conn.execute(
-            "SELECT COUNT(*) FROM tmp_sec_probe_rows"
+            "SELECT COUNT(*) FROM tmp_hp_sec_probe"
         ).fetchone()[0]
 
-        # --------------------------------------------------------------
-        # Create missing instruments first.
-        # --------------------------------------------------------------
+        # First, reopen matching existing same-symbol rows when present.
+        conn.execute(
+            """
+            UPDATE symbol_reference_history AS srh
+            SET
+                effective_from = LEAST(srh.effective_from, t.effective_from),
+                effective_to = NULL,
+                exchange = CASE
+                    WHEN srh.exchange IS NULL OR srh.exchange = '' OR srh.exchange = 'UNKNOWN'
+                        THEN t.exchange_name
+                    ELSE srh.exchange
+                END
+            FROM tmp_hp_sec_probe AS t
+            WHERE srh.symbol = t.symbol
+              AND srh.effective_to IS NOT NULL
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM symbol_reference_history AS open_srh
+                    WHERE open_srh.symbol = t.symbol
+                      AND open_srh.effective_to IS NULL
+              )
+            """
+        )
+
+        # Then create missing instruments only if still fully absent.
         conn.execute(
             """
             INSERT INTO instrument (
@@ -71,50 +96,25 @@ def run() -> None:
             ),
             missing AS (
                 SELECT
-                    p.raw_symbol,
-                    p.exchange_name,
-                    ROW_NUMBER() OVER (ORDER BY p.raw_symbol) AS rn
-                FROM tmp_sec_probe_rows AS p
+                    t.symbol,
+                    t.exchange_name,
+                    ROW_NUMBER() OVER (ORDER BY t.symbol) AS rn
+                FROM tmp_hp_sec_probe AS t
                 LEFT JOIN instrument AS i
-                    ON i.primary_ticker = p.raw_symbol
+                    ON i.primary_ticker = t.symbol
                 WHERE i.instrument_id IS NULL
             )
             SELECT
-                (SELECT max_id FROM current_max) + rn AS instrument_id,
-                'COMMON_STOCK' AS security_type,
-                'SEC_PROBE_' || raw_symbol AS company_id,
-                raw_symbol AS primary_ticker,
-                exchange_name AS primary_exchange
+                (SELECT max_id FROM current_max) + rn,
+                'COMMON_STOCK',
+                'SEC_PROBE_' || symbol,
+                symbol,
+                exchange_name
             FROM missing
             """
         )
 
-        # --------------------------------------------------------------
-        # Repair existing open-ended rows when the symbol exists but the
-        # effective_from is too late for observed price history.
-        # --------------------------------------------------------------
-        conn.execute(
-            """
-            UPDATE symbol_reference_history AS srh
-            SET
-                effective_from = p.min_price_date,
-                exchange = p.exchange_name
-            FROM tmp_sec_probe_rows AS p
-            JOIN instrument AS i
-                ON i.primary_ticker = p.raw_symbol
-            WHERE srh.instrument_id = i.instrument_id
-              AND srh.symbol = p.raw_symbol
-              AND srh.effective_to IS NULL
-              AND (
-                    srh.effective_from > p.min_price_date
-                    OR COALESCE(srh.exchange, '') <> COALESCE(p.exchange_name, '')
-              )
-            """
-        )
-
-        # --------------------------------------------------------------
-        # Create missing open-ended symbol_reference_history rows.
-        # --------------------------------------------------------------
+        # Finally insert any remaining missing open-ended symbol refs.
         conn.execute(
             """
             INSERT INTO symbol_reference_history (
@@ -133,44 +133,29 @@ def run() -> None:
             missing AS (
                 SELECT
                     i.instrument_id,
-                    p.raw_symbol,
-                    p.exchange_name,
-                    p.min_price_date,
-                    ROW_NUMBER() OVER (ORDER BY p.raw_symbol) AS rn
-                FROM tmp_sec_probe_rows AS p
+                    t.symbol,
+                    t.exchange_name,
+                    t.effective_from,
+                    ROW_NUMBER() OVER (ORDER BY t.symbol) AS rn
+                FROM tmp_hp_sec_probe AS t
                 JOIN instrument AS i
-                    ON i.primary_ticker = p.raw_symbol
+                    ON i.primary_ticker = t.symbol
                 LEFT JOIN symbol_reference_history AS srh
-                    ON srh.instrument_id = i.instrument_id
-                   AND srh.symbol = p.raw_symbol
+                    ON srh.symbol = t.symbol
                    AND srh.effective_to IS NULL
                 WHERE srh.symbol IS NULL
             )
             SELECT
-                (SELECT max_id FROM current_max) + rn AS symbol_reference_history_id,
+                (SELECT max_id FROM current_max) + rn,
                 instrument_id,
-                raw_symbol AS symbol,
-                exchange_name AS exchange,
-                TRUE AS is_primary,
-                min_price_date AS effective_from,
-                NULL AS effective_to
+                symbol,
+                exchange_name,
+                TRUE,
+                effective_from,
+                NULL
             FROM missing
             """
         )
-
-        added_symbol_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tmp_sec_probe_rows AS p
-            JOIN instrument AS i
-                ON i.primary_ticker = p.raw_symbol
-            LEFT JOIN symbol_reference_history AS srh
-                ON srh.instrument_id = i.instrument_id
-               AND srh.symbol = p.raw_symbol
-               AND srh.effective_to IS NULL
-            WHERE srh.symbol IS NOT NULL
-            """
-        ).fetchone()[0]
 
         repaired_rows = conn.execute(
             """
@@ -181,19 +166,27 @@ def run() -> None:
                 srh.effective_from,
                 srh.effective_to
             FROM symbol_reference_history AS srh
-            WHERE srh.symbol IN (
-                SELECT raw_symbol
-                FROM tmp_sec_probe_rows
-            )
-              AND srh.effective_to IS NULL
+            JOIN tmp_hp_sec_probe AS t
+                ON t.symbol = srh.symbol
+            WHERE srh.effective_to IS NULL
             ORDER BY srh.symbol
             """
         ).fetchall()
 
-        instrument_count = conn.execute(
-            "SELECT COUNT(*) FROM instrument"
+        repaired_symbol_count = len(repaired_rows)
+
+        added_symbol_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM tmp_hp_sec_probe AS t
+            LEFT JOIN symbol_reference_history AS srh
+                ON srh.symbol = t.symbol
+               AND srh.effective_to IS NULL
+            WHERE srh.symbol IS NULL
+            """
         ).fetchone()[0]
 
+        instrument_count = conn.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
         symbol_reference_history_count = conn.execute(
             "SELECT COUNT(*) FROM symbol_reference_history"
         ).fetchone()[0]
@@ -204,7 +197,7 @@ def run() -> None:
                 "job": "enrich-symbol-reference-from-high-priority-sec-probe",
                 "staged_probe_row_count": staged_probe_row_count,
                 "added_symbol_count": added_symbol_count,
-                "repaired_symbol_count": len(repaired_rows),
+                "repaired_symbol_count": repaired_symbol_count,
                 "instrument_count": instrument_count,
                 "symbol_reference_history_count": symbol_reference_history_count,
                 "repaired_rows": repaired_rows,

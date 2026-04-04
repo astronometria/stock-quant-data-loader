@@ -1,12 +1,9 @@
 """
-Initialize raw/normalized price tables for the current loader schema.
+Create canonical raw + normalized price tables.
 
-Canonical current tables:
-- price_source_daily_raw_stooq
-- price_source_daily_raw_yahoo
-- price_source_daily_normalized
-
-This module must remain the single source of truth for these table contracts.
+This file is intentionally tiny and explicit.
+It owns only the price tables that the current loader repo is supposed to
+create and maintain.
 """
 
 from __future__ import annotations
@@ -22,6 +19,11 @@ LOGGER = logging.getLogger(__name__)
 def run() -> None:
     """
     Ensure current canonical price tables exist.
+
+    Canonical tables:
+    - price_source_daily_raw_stooq
+    - price_source_daily_raw_yahoo
+    - price_source_daily_normalized
     """
     configure_logging()
     LOGGER.info("init-price-raw-tables started")

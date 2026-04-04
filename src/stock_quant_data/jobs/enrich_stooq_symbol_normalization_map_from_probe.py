@@ -1,17 +1,15 @@
 """
-Enrich stooq_symbol_normalization_map from current probe/candidate output.
+Enrich the Stooq normalization map from probe-approved format mappings.
 
-Current canonical target table:
-- stooq_symbol_normalization_map(raw_symbol, normalized_symbol, rule_name, built_at)
+Canonical source:
+- symbol_reference_candidates_from_unresolved_stooq
 
-This job only handles current format-mapping families already recognized by the
-loader:
-- WARRANT_DASH_WS  -> SYMBOL-WS => SYMBOL.W
-- UNIT_DASH_U      -> SYMBOL-U  => SYMBOL.U
-- UNDERSCORE_VARIANT -> SYMBOL_X => SYMBOL$X
+Canonical target:
+- stooq_symbol_normalization_map
 
-This job does NOT create reference identities.
-It only adds symbol-format normalization mappings.
+Important:
+- use current target column names:
+  raw_symbol, normalized_symbol, rule_name, built_at
 """
 
 from __future__ import annotations
@@ -26,7 +24,7 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Insert missing normalization-map rows inferred from current candidate data.
+    Insert approved format-mapping candidates into the canonical normalization map.
     """
     configure_logging()
     LOGGER.info("enrich-stooq-symbol-normalization-map-from-probe started")
@@ -40,21 +38,15 @@ def run() -> None:
             SELECT
                 raw_symbol,
                 CASE
-                    WHEN candidate_family = 'WARRANT_DASH_WS'
-                        THEN replace(raw_symbol, '-WS', '.W')
-                    WHEN candidate_family = 'UNIT_DASH_U'
-                        THEN replace(raw_symbol, '-U', '.U')
-                    WHEN candidate_family = 'UNDERSCORE_VARIANT'
-                        THEN replace(raw_symbol, '_', '$')
+                    WHEN candidate_family = 'WARRANT_DASH_WS' THEN replace(raw_symbol, '-WS', '.W')
+                    WHEN candidate_family = 'UNIT_DASH_U' THEN replace(raw_symbol, '-U', '.U')
+                    WHEN candidate_family = 'UNDERSCORE_VARIANT' THEN replace(raw_symbol, '_', '$')
                     ELSE NULL
                 END AS normalized_symbol,
                 CASE
-                    WHEN candidate_family = 'WARRANT_DASH_WS'
-                        THEN 'DASH_WS_TO_DOT_W'
-                    WHEN candidate_family = 'UNIT_DASH_U'
-                        THEN 'DASH_U_TO_DOT_U'
-                    WHEN candidate_family = 'UNDERSCORE_VARIANT'
-                        THEN 'UNDERSCORE_TO_DOLLAR'
+                    WHEN candidate_family = 'WARRANT_DASH_WS' THEN 'DASH_WS_TO_DOT_W'
+                    WHEN candidate_family = 'UNIT_DASH_U' THEN 'DASH_U_TO_DOT_U'
+                    WHEN candidate_family = 'UNDERSCORE_VARIANT' THEN 'UNDERSCORE_TO_DOLLAR'
                     ELSE NULL
                 END AS rule_name
             FROM symbol_reference_candidates_from_unresolved_stooq
@@ -63,12 +55,7 @@ def run() -> None:
         )
 
         staged_row_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tmp_probe_format_rows
-            WHERE normalized_symbol IS NOT NULL
-              AND rule_name IS NOT NULL
-            """
+            "SELECT COUNT(*) FROM tmp_probe_format_rows"
         ).fetchone()[0]
 
         conn.execute(
@@ -83,12 +70,11 @@ def run() -> None:
                 t.raw_symbol,
                 t.normalized_symbol,
                 t.rule_name,
-                NOW() AS built_at
+                CURRENT_TIMESTAMP
             FROM tmp_probe_format_rows AS t
             LEFT JOIN stooq_symbol_normalization_map AS m
                 ON m.raw_symbol = t.raw_symbol
             WHERE t.normalized_symbol IS NOT NULL
-              AND t.rule_name IS NOT NULL
               AND m.raw_symbol IS NULL
             """
         )
@@ -96,11 +82,11 @@ def run() -> None:
         inserted_count = conn.execute(
             """
             SELECT COUNT(*)
-            FROM stooq_symbol_normalization_map
-            WHERE raw_symbol IN (
-                SELECT raw_symbol
-                FROM tmp_probe_format_rows
-            )
+            FROM tmp_probe_format_rows AS t
+            JOIN stooq_symbol_normalization_map AS m
+                ON m.raw_symbol = t.raw_symbol
+               AND m.normalized_symbol = t.normalized_symbol
+               AND m.rule_name = t.rule_name
             """
         ).fetchone()[0]
 
@@ -110,14 +96,10 @@ def run() -> None:
 
         rows_now_present = conn.execute(
             """
-            SELECT
-                raw_symbol,
-                normalized_symbol,
-                rule_name
+            SELECT raw_symbol, normalized_symbol, rule_name
             FROM stooq_symbol_normalization_map
             WHERE raw_symbol IN (
-                SELECT raw_symbol
-                FROM tmp_probe_format_rows
+                'ALUR-WS', 'DC-WS', 'FTW-U', 'GRP-U', 'NOTE-WS', 'SCE_K'
             )
             ORDER BY raw_symbol
             """
@@ -128,7 +110,7 @@ def run() -> None:
                 "status": "ok",
                 "job": "enrich-stooq-symbol-normalization-map-from-probe",
                 "staged_row_count": staged_row_count,
-                "inserted_count": max(0, inserted_count),
+                "inserted_count": inserted_count,
                 "total_map_count": total_map_count,
                 "rows_now_present": rows_now_present,
             }

@@ -1,19 +1,12 @@
 """
-Build the canonical Stooq symbol normalization map.
+Build the base mechanical Stooq normalization map.
 
 Canonical target schema:
-- stooq_symbol_normalization_map(
-    raw_symbol,
-    normalized_symbol,
-    rule_name,
-    built_at
-  )
+- stooq_symbol_normalization_map(raw_symbol, normalized_symbol, rule_name, built_at)
 
 Important:
-- only current column names are used
-- this job performs a deterministic rebuild from unresolved Stooq symbols
-- explicit manually-added rows from later enrichment jobs remain possible, but
-  this job itself seeds the broad mechanical rules
+- this job owns only mechanical format conversions
+- it must not invent identity mappings
 """
 
 from __future__ import annotations
@@ -28,7 +21,7 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Rebuild the broad mechanical Stooq normalization map.
+    Rebuild mechanical normalization rules from currently unresolved raw symbols.
     """
     configure_logging()
     LOGGER.info("build-stooq-symbol-normalization-map started")
@@ -38,7 +31,13 @@ def run() -> None:
         conn.execute("DELETE FROM stooq_symbol_normalization_map")
 
         # ------------------------------------------------------------------
-        # Seed broad rules directly from unresolved normalized raw symbols.
+        # Rule families:
+        # - underscore preferred-style -> dollar preferred-style
+        # - warrant suffix -WS -> .W
+        # - unit suffix -U -> .U
+        #
+        # We only insert a rule when the normalized symbol already exists as an
+        # open-ended reference symbol. This prevents bad speculative mappings.
         # ------------------------------------------------------------------
         conn.execute(
             """
@@ -48,77 +47,47 @@ def run() -> None:
                 rule_name,
                 built_at
             )
-            WITH unresolved_symbols AS (
+            WITH unresolved AS (
                 SELECT DISTINCT raw_symbol
-                FROM price_source_daily_normalized
-                WHERE source_name = 'stooq'
-                  AND symbol_resolution_status <> 'RESOLVED'
+                FROM price_source_daily_raw_stooq
             ),
             staged AS (
                 SELECT
                     raw_symbol,
-                    replace(raw_symbol, '_', '$') AS normalized_symbol,
-                    'UNDERSCORE_TO_DOLLAR' AS rule_name
-                FROM unresolved_symbols
-                WHERE raw_symbol LIKE '%\_%' ESCAPE '\'
-
-                UNION ALL
-
-                SELECT
-                    raw_symbol,
-                    replace(raw_symbol, '-WS', '.W') AS normalized_symbol,
-                    'DASH_WS_TO_DOT_W' AS rule_name
-                FROM unresolved_symbols
-                WHERE raw_symbol LIKE '%-WS'
-
-                UNION ALL
-
-                SELECT
-                    raw_symbol,
-                    replace(raw_symbol, '-U', '.U') AS normalized_symbol,
-                    'DASH_U_TO_DOT_U' AS rule_name
-                FROM unresolved_symbols
-                WHERE raw_symbol LIKE '%-U'
-
-                UNION ALL
-
-                SELECT
-                    raw_symbol,
-                    replace(raw_symbol, '-R', '.R') AS normalized_symbol,
-                    'DASH_R_TO_DOT_R' AS rule_name
-                FROM unresolved_symbols
-                WHERE raw_symbol LIKE '%-R'
-
-                UNION ALL
-
-                SELECT
-                    raw_symbol,
-                    replace(raw_symbol, '-', '.') AS normalized_symbol,
-                    'DASH_CLASS_TO_DOT_CLASS' AS rule_name
-                FROM unresolved_symbols
-                WHERE raw_symbol LIKE '%-%'
-                  AND raw_symbol NOT LIKE '%-WS'
-                  AND raw_symbol NOT LIKE '%-U'
-                  AND raw_symbol NOT LIKE '%-R'
+                    CASE
+                        WHEN raw_symbol LIKE '%\_%' ESCAPE '\' THEN replace(raw_symbol, '_', '$')
+                        WHEN raw_symbol LIKE '%-WS' THEN replace(raw_symbol, '-WS', '.W')
+                        WHEN raw_symbol LIKE '%-U' THEN replace(raw_symbol, '-U', '.U')
+                        ELSE NULL
+                    END AS normalized_symbol,
+                    CASE
+                        WHEN raw_symbol LIKE '%\_%' ESCAPE '\' THEN 'UNDERSCORE_TO_DOLLAR'
+                        WHEN raw_symbol LIKE '%-WS' THEN 'DASH_WS_TO_DOT_W'
+                        WHEN raw_symbol LIKE '%-U' THEN 'DASH_U_TO_DOT_U'
+                        ELSE NULL
+                    END AS rule_name
+                FROM unresolved
             )
-            SELECT DISTINCT
-                raw_symbol,
-                normalized_symbol,
-                rule_name,
-                NOW() AS built_at
-            FROM staged
+            SELECT
+                s.raw_symbol,
+                s.normalized_symbol,
+                s.rule_name,
+                CURRENT_TIMESTAMP
+            FROM staged AS s
+            JOIN symbol_reference_history AS srh
+                ON srh.symbol = s.normalized_symbol
+               AND srh.effective_to IS NULL
+            WHERE s.normalized_symbol IS NOT NULL
             """
         )
 
-        map_count = conn.execute(
+        row_count = conn.execute(
             "SELECT COUNT(*) FROM stooq_symbol_normalization_map"
         ).fetchone()[0]
 
-        rows_by_rule = conn.execute(
+        by_rule_name = conn.execute(
             """
-            SELECT
-                rule_name,
-                COUNT(*)
+            SELECT rule_name, COUNT(*)
             FROM stooq_symbol_normalization_map
             GROUP BY rule_name
             ORDER BY COUNT(*) DESC, rule_name
@@ -129,8 +98,8 @@ def run() -> None:
             {
                 "status": "ok",
                 "job": "build-stooq-symbol-normalization-map",
-                "map_count": map_count,
-                "rows_by_rule": rows_by_rule,
+                "row_count": row_count,
+                "rows_by_rule_name": by_rule_name,
             }
         )
     finally:

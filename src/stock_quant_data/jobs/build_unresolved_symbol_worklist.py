@@ -1,19 +1,8 @@
 """
-Build the current unresolved symbol worklist.
+Build the review worklist from current unresolved candidates.
 
-Current canonical input:
-- symbol_reference_candidates_from_unresolved_stooq
-
-Current canonical output:
+Canonical target:
 - unresolved_symbol_worklist
-
-The worklist intentionally excludes:
-- pure format-only mapping tasks
-- low-volume later-review tasks
-
-It keeps:
-- REVIEW_FOR_REFERENCE_IDENTITY_CREATION
-- REVIEW_FOR_REFERENCE_IDENTITY_CREATION_HIGH_PRIORITY
 """
 
 from __future__ import annotations
@@ -28,7 +17,7 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Rebuild unresolved_symbol_worklist from current candidate rows.
+    Rebuild the unresolved symbol worklist table.
     """
     configure_logging()
     LOGGER.info("build-unresolved-symbol-worklist started")
@@ -57,7 +46,7 @@ def run() -> None:
                 candidate_family,
                 suggested_action,
                 recency_bucket,
-                NOW() AS built_at
+                CURRENT_TIMESTAMP
             FROM symbol_reference_candidates_from_unresolved_stooq
             WHERE suggested_action IN (
                 'REVIEW_FOR_REFERENCE_IDENTITY_CREATION',
@@ -73,9 +62,7 @@ def run() -> None:
 
         rows_by_suggested_action = conn.execute(
             """
-            SELECT
-                suggested_action,
-                COUNT(*)
+            SELECT suggested_action, COUNT(*)
             FROM unresolved_symbol_worklist
             GROUP BY suggested_action
             ORDER BY COUNT(*) DESC, suggested_action

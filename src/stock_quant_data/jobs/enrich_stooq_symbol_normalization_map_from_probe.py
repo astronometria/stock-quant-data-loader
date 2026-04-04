@@ -1,31 +1,25 @@
 """
-Enrich stooq_symbol_normalization_map from the unresolved symbol probe.
+Enrich the Stooq symbol normalization map from the current unresolved-symbol probe.
 
-Why this job exists
--------------------
-The earlier version used the wrong target column name when inserting into
-stooq_symbol_normalization_map.
-
-The real schema is:
-
+Design:
+- SQL-first
+- additive only
+- conservative: only insert mappings whose normalized target symbol already exists
+  as an open-ended row in symbol_reference_history
+- use the CURRENT real schema of stooq_symbol_normalization_map:
     raw_symbol
     normalized_symbol
     rule_name
     built_at
 
-This version writes against the real schema and only inserts deterministic
-format-mapping candidates that are already surfaced by the probe layer.
+Why this job exists:
+- the broad builder already handles generic safe rule families
+- this job adds a very small, explicit batch of probe-confirmed format mappings
+- it must never invent identities that do not exist in master data
 
-Current deterministic mappings handled here
--------------------------------------------
-- UNIT_DASH_U        : GRP-U   -> GRP.U
-- WARRANT_DASH_WS    : NOTE-WS -> NOTE.W
-- UNDERSCORE_VARIANT : SCE_K   -> SCE$K
-
-We keep this job intentionally narrow and explicit:
-- only rows already classified by the candidate/probe layer
-- only deterministic transformations
-- no fuzzy guessing
+Important:
+- this job only handles the pure symbol-format mappings discovered by the probe
+- reference-identity creation remains a separate concern
 """
 
 from __future__ import annotations
@@ -40,7 +34,20 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Insert deterministic Stooq symbol normalization mappings from the candidate table.
+    Insert conservative, probe-confirmed symbol-format mappings into
+    stooq_symbol_normalization_map.
+
+    Current intended mappings:
+    - GRP-U   -> GRP.U
+    - FTW-U   -> FTW.U
+    - NOTE-WS -> NOTE.W
+    - DC-WS   -> DC.W
+    - ALUR-WS -> ALUR.W
+    - SCE_K   -> SCE$K
+
+    Safety rule:
+    - only insert a row when the normalized target symbol already exists in the
+      open-ended reference layer
     """
     configure_logging()
     LOGGER.info("enrich-stooq-symbol-normalization-map-from-probe started")
@@ -48,54 +55,45 @@ def run() -> None:
     conn = connect_build_db()
     try:
         # ------------------------------------------------------------------
-        # Stage deterministic mappings from the candidate table.
-        #
-        # We purposely use the already-built candidate classification rather
-        # than re-inventing parsing logic again in Python.
+        # Ensure the destination table exists with the canonical schema.
         # ------------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_probe_format_mappings")
         conn.execute(
             """
-            CREATE TEMP TABLE tmp_probe_format_mappings AS
-            SELECT
-                raw_symbol,
-                CASE
-                    WHEN candidate_family = 'UNIT_DASH_U'
-                        THEN replace(raw_symbol, '-U', '.U')
-                    WHEN candidate_family = 'WARRANT_DASH_WS'
-                        THEN replace(raw_symbol, '-WS', '.W')
-                    WHEN candidate_family = 'UNDERSCORE_VARIANT'
-                        THEN replace(raw_symbol, '_', '$')
-                    ELSE NULL
-                END AS normalized_symbol,
-                CASE
-                    WHEN candidate_family = 'UNIT_DASH_U'
-                        THEN 'DASH_U_TO_DOT_U'
-                    WHEN candidate_family = 'WARRANT_DASH_WS'
-                        THEN 'DASH_WS_TO_DOT_W'
-                    WHEN candidate_family = 'UNDERSCORE_VARIANT'
-                        THEN 'UNDERSCORE_TO_DOLLAR'
-                    ELSE NULL
-                END AS rule_name
-            FROM symbol_reference_candidates_from_unresolved_stooq
-            WHERE suggested_action = 'REVIEW_FOR_SYMBOL_FORMAT_MAPPING'
+            CREATE TABLE IF NOT EXISTS stooq_symbol_normalization_map (
+                raw_symbol VARCHAR,
+                normalized_symbol VARCHAR,
+                rule_name VARCHAR,
+                built_at TIMESTAMP WITH TIME ZONE
+            )
             """
         )
 
-        staged_row_count = conn.execute(
+        # ------------------------------------------------------------------
+        # Stage the small explicit set of probe-confirmed format mappings.
+        #
+        # These are symbol-shape transforms only. They are NOT new identity rows.
+        # ------------------------------------------------------------------
+        conn.execute("DROP TABLE IF EXISTS tmp_probe_format_symbol_map")
+        conn.execute(
             """
-            SELECT COUNT(*)
-            FROM tmp_probe_format_mappings
-            WHERE normalized_symbol IS NOT NULL
-              AND rule_name IS NOT NULL
+            CREATE TEMP TABLE tmp_probe_format_symbol_map AS
+            SELECT *
+            FROM (
+                VALUES
+                    ('ALUR-WS', 'ALUR.W', 'DASH_WS_TO_DOT_W'),
+                    ('DC-WS',   'DC.W',   'DASH_WS_TO_DOT_W'),
+                    ('FTW-U',   'FTW.U',  'DASH_U_TO_DOT_U'),
+                    ('GRP-U',   'GRP.U',  'DASH_U_TO_DOT_U'),
+                    ('NOTE-WS', 'NOTE.W', 'DASH_WS_TO_DOT_W'),
+                    ('SCE_K',   'SCE$K',  'UNDERSCORE_TO_DOLLAR')
+            ) AS t(raw_symbol, normalized_symbol, rule_name)
             """
-        ).fetchone()[0]
+        )
 
         # ------------------------------------------------------------------
-        # Insert only mappings not already present.
-        #
-        # The key is the raw_symbol here because the map is conceptually a
-        # single normalization decision per raw Stooq symbol.
+        # Insert only mappings whose target symbol exists in the current
+        # open-ended reference layer, and only if the raw_symbol is not already
+        # present in the normalization map.
         # ------------------------------------------------------------------
         inserted_count = conn.execute(
             """
@@ -110,13 +108,14 @@ def run() -> None:
                 s.normalized_symbol,
                 s.rule_name,
                 CURRENT_TIMESTAMP
-            FROM tmp_probe_format_mappings s
-            LEFT JOIN stooq_symbol_normalization_map existing
-                ON existing.raw_symbol = s.raw_symbol
-            WHERE s.normalized_symbol IS NOT NULL
-              AND s.rule_name IS NOT NULL
-              AND existing.raw_symbol IS NULL
-            RETURNING raw_symbol
+            FROM tmp_probe_format_symbol_map AS s
+            JOIN symbol_reference_history AS srh
+              ON srh.symbol = s.normalized_symbol
+             AND srh.effective_to IS NULL
+            LEFT JOIN stooq_symbol_normalization_map AS existing
+              ON existing.raw_symbol = s.raw_symbol
+            WHERE existing.raw_symbol IS NULL
+            RETURNING 1
             """
         ).fetchall()
 
@@ -124,17 +123,14 @@ def run() -> None:
             "SELECT COUNT(*) FROM stooq_symbol_normalization_map"
         ).fetchone()[0]
 
-        inserted_rows = conn.execute(
+        rows_now_present = conn.execute(
             """
             SELECT
                 raw_symbol,
                 normalized_symbol,
                 rule_name
             FROM stooq_symbol_normalization_map
-            WHERE raw_symbol IN (
-                SELECT raw_symbol
-                FROM tmp_probe_format_mappings
-            )
+            WHERE raw_symbol IN ('ALUR-WS', 'DC-WS', 'FTW-U', 'GRP-U', 'NOTE-WS', 'SCE_K')
             ORDER BY raw_symbol
             """
         ).fetchall()
@@ -143,10 +139,10 @@ def run() -> None:
             {
                 "status": "ok",
                 "job": "enrich-stooq-symbol-normalization-map-from-probe",
-                "staged_row_count": staged_row_count,
+                "staged_row_count": 6,
                 "inserted_count": len(inserted_count),
                 "total_map_count": total_map_count,
-                "rows_now_present": inserted_rows,
+                "rows_now_present": rows_now_present,
             }
         )
     finally:

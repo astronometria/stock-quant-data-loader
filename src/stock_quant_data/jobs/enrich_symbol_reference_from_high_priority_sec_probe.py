@@ -1,38 +1,24 @@
 """
-Repair symbol_reference_history from the high priority unresolved symbol probe.
+Repair high-priority unresolved symbols using current probe output plus the SEC-targeted
+symbol table.
 
-Why this job exists
--------------------
-The earlier version only inserted brand new symbols that did not already exist in the
-reference layer.
+Design:
+- SQL-first
+- additive/repair-only
+- no duplicate open-ended rows
+- do not create speculative identities
+- use the CURRENT real schema of high_priority_unresolved_symbol_probe:
+    raw_symbol
+    unresolved_row_count
+    ...
+    sec_exact_matches
+    probe_recommendation
+    built_at
 
-That is not enough for the current loader state, because some symbols already exist in
-symbol_reference_history but with a broken interval such as:
-
-    effective_from = 2026-03-29
-    effective_to   = 2026-03-29
-
-Those rows technically exist, so the old "insert only if missing" logic adds nothing,
-but price normalization still cannot resolve the historical Stooq rows because the
-interval does not cover the historical price dates.
-
-This version repairs the identity layer in a SQL-first way:
-
-1. Take rows from high_priority_unresolved_symbol_probe that are marked
-   LIKELY_CREATE_REFERENCE_FROM_SEC.
-2. Reuse an existing instrument when primary_ticker already matches the raw symbol.
-3. Create a missing instrument only when absolutely necessary.
-4. Replace the symbol_reference_history row(s) for these symbols with a repaired
-   interval:
-      effective_from = min_price_date from the probe
-      effective_to   = NULL
-5. Preserve a single clean open-ended mapping per symbol.
-
-Important note
---------------
-This job intentionally focuses on making the loader DB internally consistent and able to
-resolve historical prices. It does not attempt a full PIT-perfect corporate action
-reconstruction for these names.
+Important:
+- this job repairs symbol_reference_history for existing instruments where the
+  correct instrument already exists in the reference layer / SEC-targeted layer
+- it does not attempt broad historical reconstruction
 """
 
 from __future__ import annotations
@@ -47,173 +33,85 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Repair or create symbol reference rows for SEC-backed high-priority unresolved symbols.
+    Repair open-ended symbol_reference_history rows for the SEC-likely probe set.
+
+    Current intended scope:
+    - BXMX
+    - DIAX
+    - BBU
+    - RILYK
+
+    Repair rule:
+    - if a matching instrument already exists by primary_ticker, reuse it
+    - close any currently open conflicting row for that symbol
+    - insert one clean open-ended row starting from the earliest unresolved
+      price date observed in the probe
     """
     configure_logging()
     LOGGER.info("enrich-symbol-reference-from-high-priority-sec-probe started")
 
     conn = connect_build_db()
     try:
-        # ------------------------------------------------------------------
-        # Stage the exact symbols we want to repair.
-        #
-        # We keep the staging explicit and small:
-        # - only SEC-backed recommendations
-        # - one row per raw_symbol
-        # - attach SEC exchange/company context when available
-        # - attach existing instrument if one already exists
-        # ------------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_sec_probe_stage")
+        conn.execute("DROP TABLE IF EXISTS tmp_high_priority_sec_probe_repairs")
         conn.execute(
             """
-            CREATE TEMP TABLE tmp_sec_probe_stage AS
-            WITH probe AS (
+            CREATE TEMP TABLE tmp_high_priority_sec_probe_repairs AS
+            WITH probe_scope AS (
                 SELECT
                     raw_symbol,
                     min_price_date,
                     max_price_date,
-                    sec_exact_matches,
                     probe_recommendation
                 FROM high_priority_unresolved_symbol_probe
                 WHERE probe_recommendation = 'LIKELY_CREATE_REFERENCE_FROM_SEC'
             ),
-            sec_map AS (
-                SELECT
-                    symbol,
-                    MAX(cik) AS cik,
-                    MAX(company_name) AS company_name,
-                    MAX(exchange) AS exchange
-                FROM sec_symbol_company_map_targeted
-                GROUP BY symbol
-            ),
             existing_instrument AS (
                 SELECT
-                    primary_ticker,
-                    MIN(instrument_id) AS instrument_id
-                FROM instrument
-                GROUP BY primary_ticker
+                    p.raw_symbol,
+                    p.min_price_date,
+                    p.max_price_date,
+                    i.instrument_id,
+                    i.primary_exchange
+                FROM probe_scope AS p
+                JOIN instrument AS i
+                  ON i.primary_ticker = p.raw_symbol
             )
-            SELECT
-                p.raw_symbol,
-                p.min_price_date,
-                p.max_price_date,
-                s.cik,
-                s.company_name,
-                COALESCE(NULLIF(s.exchange, ''), 'UNKNOWN') AS exchange_name,
-                ei.instrument_id AS existing_instrument_id
-            FROM probe p
-            LEFT JOIN sec_map s
-                ON s.symbol = p.raw_symbol
-            LEFT JOIN existing_instrument ei
-                ON ei.primary_ticker = p.raw_symbol
-            """
-        )
-
-        staged_probe_row_count = conn.execute(
-            "SELECT COUNT(*) FROM tmp_sec_probe_stage"
-        ).fetchone()[0]
-
-        # ------------------------------------------------------------------
-        # Create missing instruments only when no existing primary_ticker match
-        # exists already.
-        #
-        # This keeps the job conservative and avoids creating duplicate primary
-        # tickers when we already have an instrument row.
-        # ------------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_sec_probe_missing_instruments")
-        conn.execute(
-            """
-            CREATE TEMP TABLE tmp_sec_probe_missing_instruments AS
             SELECT
                 raw_symbol,
                 min_price_date,
                 max_price_date,
-                cik,
-                company_name,
-                exchange_name
-            FROM tmp_sec_probe_stage
-            WHERE existing_instrument_id IS NULL
+                instrument_id,
+                primary_exchange AS exchange_name
+            FROM existing_instrument
             """
         )
 
-        missing_instrument_count = conn.execute(
-            "SELECT COUNT(*) FROM tmp_sec_probe_missing_instruments"
+        staged_probe_row_count = conn.execute(
+            "SELECT COUNT(*) FROM tmp_high_priority_sec_probe_repairs"
         ).fetchone()[0]
 
-        if missing_instrument_count > 0:
-            conn.execute(
-                """
-                INSERT INTO instrument (
-                    instrument_id,
-                    security_type,
-                    company_id,
-                    primary_ticker,
-                    primary_exchange
-                )
-                WITH current_max AS (
-                    SELECT COALESCE(MAX(instrument_id), 0) AS max_id
-                    FROM instrument
-                ),
-                staged AS (
-                    SELECT
-                        raw_symbol,
-                        exchange_name,
-                        cik,
-                        ROW_NUMBER() OVER (ORDER BY raw_symbol) AS rn
-                    FROM tmp_sec_probe_missing_instruments
-                )
-                SELECT
-                    (SELECT max_id FROM current_max) + rn AS instrument_id,
-                    'COMMON_STOCK' AS security_type,
-                    CASE
-                        WHEN cik IS NOT NULL AND cik <> '' THEN 'SEC_' || cik
-                        ELSE 'SEC_' || raw_symbol
-                    END AS company_id,
-                    raw_symbol AS primary_ticker,
-                    exchange_name AS primary_exchange
-                FROM staged
-                """
-            )
-
         # ------------------------------------------------------------------
-        # Refresh the stage with a guaranteed instrument_id for every symbol.
+        # Close conflicting open-ended rows for the repaired symbols.
         # ------------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_sec_probe_resolved_stage")
         conn.execute(
             """
-            CREATE TEMP TABLE tmp_sec_probe_resolved_stage AS
-            SELECT
-                s.raw_symbol,
-                s.min_price_date,
-                s.max_price_date,
-                s.cik,
-                s.company_name,
-                s.exchange_name,
-                i.instrument_id
-            FROM tmp_sec_probe_stage s
-            JOIN instrument i
-                ON i.primary_ticker = s.raw_symbol
+            UPDATE symbol_reference_history AS srh
+            SET effective_to = r.min_price_date - INTERVAL 1 DAY
+            FROM tmp_high_priority_sec_probe_repairs AS r
+            WHERE srh.symbol = r.raw_symbol
+              AND srh.effective_to IS NULL
+              AND (
+                    srh.instrument_id <> r.instrument_id
+                 OR COALESCE(srh.exchange, '') <> COALESCE(r.exchange_name, '')
+              )
             """
         )
 
         # ------------------------------------------------------------------
-        # Delete existing symbol_reference_history rows for those exact symbols,
-        # then insert one repaired open-ended interval per symbol.
-        #
-        # This is the key behavioral change versus the broken earlier version:
-        # existing-but-bad rows are actively repaired.
+        # Insert the repaired open-ended row only if the exact open row does not
+        # already exist.
         # ------------------------------------------------------------------
-        conn.execute(
-            """
-            DELETE FROM symbol_reference_history
-            WHERE symbol IN (
-                SELECT raw_symbol
-                FROM tmp_sec_probe_resolved_stage
-            )
-            """
-        )
-
-        conn.execute(
+        repaired_rows = conn.execute(
             """
             INSERT INTO symbol_reference_history (
                 symbol_reference_history_id,
@@ -228,14 +126,20 @@ def run() -> None:
                 SELECT COALESCE(MAX(symbol_reference_history_id), 0) AS max_id
                 FROM symbol_reference_history
             ),
-            staged AS (
+            missing AS (
                 SELECT
-                    instrument_id,
-                    raw_symbol,
-                    exchange_name,
-                    min_price_date,
-                    ROW_NUMBER() OVER (ORDER BY raw_symbol) AS rn
-                FROM tmp_sec_probe_resolved_stage
+                    r.raw_symbol,
+                    r.instrument_id,
+                    r.exchange_name,
+                    r.min_price_date,
+                    ROW_NUMBER() OVER (ORDER BY r.raw_symbol) AS rn
+                FROM tmp_high_priority_sec_probe_repairs AS r
+                LEFT JOIN symbol_reference_history AS srh
+                  ON srh.symbol = r.raw_symbol
+                 AND srh.instrument_id = r.instrument_id
+                 AND COALESCE(srh.exchange, '') = COALESCE(r.exchange_name, '')
+                 AND srh.effective_to IS NULL
+                WHERE srh.symbol IS NULL
             )
             SELECT
                 (SELECT max_id FROM current_max) + rn AS symbol_reference_history_id,
@@ -245,23 +149,10 @@ def run() -> None:
                 TRUE AS is_primary,
                 min_price_date AS effective_from,
                 NULL AS effective_to
-            FROM staged
+            FROM missing
+            RETURNING symbol, instrument_id, exchange, effective_from, effective_to
             """
-        )
-
-        added_symbol_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tmp_sec_probe_missing_instruments
-            """
-        ).fetchone()[0]
-
-        repaired_symbol_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tmp_sec_probe_resolved_stage
-            """
-        ).fetchone()[0]
+        ).fetchall()
 
         instrument_count = conn.execute(
             "SELECT COUNT(*) FROM instrument"
@@ -271,30 +162,13 @@ def run() -> None:
             "SELECT COUNT(*) FROM symbol_reference_history"
         ).fetchone()[0]
 
-        repaired_rows = conn.execute(
-            """
-            SELECT
-                symbol,
-                instrument_id,
-                exchange,
-                effective_from,
-                effective_to
-            FROM symbol_reference_history
-            WHERE symbol IN (
-                SELECT raw_symbol
-                FROM tmp_sec_probe_resolved_stage
-            )
-            ORDER BY symbol
-            """
-        ).fetchall()
-
         print(
             {
                 "status": "ok",
                 "job": "enrich-symbol-reference-from-high-priority-sec-probe",
                 "staged_probe_row_count": staged_probe_row_count,
-                "added_symbol_count": added_symbol_count,
-                "repaired_symbol_count": repaired_symbol_count,
+                "added_symbol_count": 0,
+                "repaired_symbol_count": len(repaired_rows),
                 "instrument_count": instrument_count,
                 "symbol_reference_history_count": symbol_reference_history_count,
                 "repaired_rows": repaired_rows,

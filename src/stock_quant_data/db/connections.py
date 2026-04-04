@@ -1,44 +1,48 @@
 """
-DuckDB connection helpers.
+DuckDB connection helpers for stock-quant-data-loader.
 
-Scientific design rule:
-- mutable build DB for ingestion / normalization / checks
-- immutable serving DB for API reads
-
-The API must never read directly from the build DB.
+Design:
+- one canonical build DB
+- one obvious connection entrypoint
+- no legacy path fallbacks
 """
 
+from __future__ import annotations
+
 from pathlib import Path
+
 import duckdb
 
-from stock_quant_data.config.settings import get_settings
+from stock_quant_data.config.settings import settings
 
 
-def connect_build_db() -> duckdb.DuckDBPyConnection:
+def _ensure_parent_dir(db_path: Path) -> None:
     """
-    Open the mutable build database.
+    Ensure the parent directory for the DB exists.
 
-    This connection is intended for jobs, not for the serving API.
+    This is safe and idempotent.
     """
-    settings = get_settings()
-    settings.build_db_path.parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(str(settings.build_db_path))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def connect_serving_db_read_only() -> duckdb.DuckDBPyConnection:
+def connect_build_db(*, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     """
-    Open the current serving database in read-only mode.
+    Connect to the canonical build DB for the current loader repo.
 
-    We fail loudly if the current release does not exist,
-    because serving without a published release would be misleading.
+    Important:
+    - every CURRENT loader job should use this function
+    - scripts must not hardcode older repo paths
     """
-    settings = get_settings()
-    db_path: Path = settings.current_release_db_path
+    settings.ensure_directories()
+    db_path = Path(settings.build_db_path)
+    _ensure_parent_dir(db_path)
 
-    if not db_path.exists():
-        raise FileNotFoundError(
-            f"Serving database not found at '{db_path}'. "
-            "Publish a release before starting the API."
-        )
+    conn = duckdb.connect(str(db_path), read_only=read_only)
 
-    return duckdb.connect(str(db_path), read_only=True)
+    # ------------------------------------------------------------------
+    # Keep runtime predictable and quiet for CLI usage.
+    # ------------------------------------------------------------------
+    conn.execute("PRAGMA enable_progress_bar=false")
+    conn.execute("PRAGMA threads=4")
+
+    return conn

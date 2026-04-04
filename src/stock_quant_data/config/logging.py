@@ -1,12 +1,13 @@
 """
-Logging helpers.
+Logging configuration for stock-quant-data-loader.
 
-The goal is not to build a giant logging framework in v1.
-We only want:
-- readable terminal logs
-- consistent timestamps
-- minimal structured context
+Intent:
+- deterministic logging
+- clean CLI logs
+- no duplicate handlers on repeated imports
 """
+
+from __future__ import annotations
 
 import logging
 import sys
@@ -14,10 +15,12 @@ import sys
 
 def configure_logging(level: int = logging.INFO) -> None:
     """
-    Configure root logging once for the application.
+    Configure root logging exactly once.
 
-    This is intentionally simple for v1.
-    It can later evolve into JSON logs if needed.
+    Why force=True:
+    - many of the jobs are executed repeatedly in the same interpreter during
+      tests or orchestration
+    - force=True prevents duplicate handlers and duplicated log lines
     """
     logging.basicConfig(
         level=level,

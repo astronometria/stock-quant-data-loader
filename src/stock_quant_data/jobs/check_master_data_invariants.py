@@ -1,8 +1,5 @@
 """
-Canonical invariant checks for the current loader database.
-
-This module is intentionally strict and only refers to the
-current canonical table names used by the active codebase.
+Check master-data invariants for the canonical loader schema.
 """
 
 from __future__ import annotations
@@ -17,12 +14,12 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Run key integrity checks over the canonical master-data layer.
+    Probe the invariants that should always hold after loader jobs.
 
-    Current checks:
+    Invariants:
     - no duplicate open-ended symbol_reference_history rows per symbol
-    - no duplicate instrument rows per primary_ticker
-    - no duplicate normalized rows per (source_name, source_row_id)
+    - no duplicate instrument.primary_ticker rows
+    - no duplicate normalized source row ids per source
     """
     configure_logging()
     LOGGER.info("check-master-data-invariants started")

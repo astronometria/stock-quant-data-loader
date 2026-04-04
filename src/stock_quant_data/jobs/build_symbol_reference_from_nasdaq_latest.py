@@ -1,12 +1,12 @@
 """
-Build a current snapshot instrument + symbol reference layer
-from the latest Nasdaq snapshot.
+Build a current-snapshot instrument + symbol reference layer from the latest
+complete Nasdaq Trader raw snapshot.
 
-Important table contract:
-- instrument.primary_ticker is the canonical current symbol
-- symbol_reference_history stores the historical/open interval mapping
-- this job writes CURRENT snapshot rows only
-- later enrichment jobs may back-extend effective_from dates
+Canonical behavior:
+- keep instrument as the identity table
+- rebuild only the current open-ended symbol_reference_history layer
+- do not inject legacy demo rows
+- do not duplicate currently open symbols
 """
 
 from __future__ import annotations
@@ -20,15 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run() -> None:
-    """
-    Rebuild current symbol reference state from the latest Nasdaq snapshot.
-
-    Notes:
-    - We use current snapshot presence to seed current open intervals.
-    - We do not create duplicate open intervals for the same symbol.
-    - We intentionally do not preserve older demo-only FB/META seed rows here.
-      The current repo should be data-driven first.
-    """
+    """Build the current latest-snapshot identity layer."""
     configure_logging()
     LOGGER.info("build-symbol-reference-from-nasdaq-latest started")
 
@@ -52,7 +44,9 @@ def run() -> None:
         ).fetchone()
 
         if latest_snapshot_id_row is None:
-            raise RuntimeError("No Nasdaq snapshot found in nasdaq_symbol_directory_raw")
+            raise RuntimeError(
+                "No complete Nasdaq Trader snapshot found in nasdaq_symbol_directory_raw"
+            )
 
         latest_snapshot_id = latest_snapshot_id_row[0]
 
@@ -74,16 +68,7 @@ def run() -> None:
                     WHEN upper(security_name) LIKE '%UNIT%' THEN 'UNIT'
                     WHEN upper(security_name) LIKE '%PREFERRED%' THEN 'PREFERRED_STOCK'
                     ELSE 'COMMON_STOCK'
-                END AS security_type,
-                CASE
-                    WHEN exchange_code = 'Q' THEN 'NASDAQ'
-                    WHEN exchange_code = 'N' THEN 'NYSE'
-                    WHEN exchange_code = 'A' THEN 'NYSEMKT'
-                    WHEN exchange_code = 'P' THEN 'NYSEARCA'
-                    WHEN exchange_code = 'Z' THEN 'BATS'
-                    WHEN exchange_code = 'V' THEN 'IEX'
-                    ELSE COALESCE(exchange_code, 'UNKNOWN')
-                END AS exchange_name
+                END AS security_type
             FROM nasdaq_symbol_directory_raw
             WHERE snapshot_id = ?
               AND symbol IS NOT NULL
@@ -93,9 +78,6 @@ def run() -> None:
             [latest_snapshot_id],
         )
 
-        # --------------------------------------------------------------
-        # Insert any missing instruments by canonical current ticker.
-        # --------------------------------------------------------------
         conn.execute(
             """
             INSERT INTO instrument (
@@ -113,11 +95,19 @@ def run() -> None:
                 SELECT
                     u.symbol,
                     u.security_type,
-                    u.exchange_name,
+                    CASE
+                        WHEN u.exchange_code = 'Q' THEN 'NASDAQ'
+                        WHEN u.exchange_code = 'N' THEN 'NYSE'
+                        WHEN u.exchange_code = 'A' THEN 'NYSEMKT'
+                        WHEN u.exchange_code = 'P' THEN 'NYSEARCA'
+                        WHEN u.exchange_code = 'Z' THEN 'BATS'
+                        WHEN u.exchange_code = 'V' THEN 'IEX'
+                        ELSE COALESCE(u.exchange_code, 'UNKNOWN')
+                    END AS primary_exchange,
                     ROW_NUMBER() OVER (ORDER BY u.symbol) AS rn
                 FROM tmp_nasdaq_latest_symbol_universe u
                 LEFT JOIN instrument i
-                    ON i.primary_ticker = u.symbol
+                  ON i.primary_ticker = u.symbol
                 WHERE i.instrument_id IS NULL
             )
             SELECT
@@ -125,17 +115,63 @@ def run() -> None:
                 security_type,
                 'NASDAQTRADER_' || symbol AS company_id,
                 symbol AS primary_ticker,
-                exchange_name AS primary_exchange
+                primary_exchange
             FROM missing
             """
         )
 
-        # --------------------------------------------------------------
-        # Replace only the current open-ended reference layer.
-        # Historical closed intervals are left to the broader snapshot job
-        # or to later enrichment jobs.
-        # --------------------------------------------------------------
-        conn.execute("DELETE FROM symbol_reference_history WHERE effective_to IS NULL")
+        conn.execute("DROP TABLE IF EXISTS tmp_latest_open_symbol_refs")
+        conn.execute(
+            """
+            CREATE TEMP TABLE tmp_latest_open_symbol_refs AS
+            SELECT
+                i.instrument_id,
+                u.symbol,
+                CASE
+                    WHEN u.exchange_code = 'Q' THEN 'NASDAQ'
+                    WHEN u.exchange_code = 'N' THEN 'NYSE'
+                    WHEN u.exchange_code = 'A' THEN 'NYSEMKT'
+                    WHEN u.exchange_code = 'P' THEN 'NYSEARCA'
+                    WHEN u.exchange_code = 'Z' THEN 'BATS'
+                    WHEN u.exchange_code = 'V' THEN 'IEX'
+                    ELSE COALESCE(u.exchange_code, 'UNKNOWN')
+                END AS exchange_name
+            FROM tmp_nasdaq_latest_symbol_universe u
+            JOIN instrument i
+              ON i.primary_ticker = u.symbol
+            """
+        )
+
+        conn.execute(
+            """
+            UPDATE symbol_reference_history srh
+            SET effective_to = DATE '2026-03-29'
+            WHERE srh.effective_to IS NULL
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM tmp_latest_open_symbol_refs t
+                    WHERE t.symbol = srh.symbol
+                      AND t.instrument_id = srh.instrument_id
+              )
+            """
+        )
+
+        conn.execute("DROP TABLE IF EXISTS tmp_missing_latest_open_refs")
+        conn.execute(
+            """
+            CREATE TEMP TABLE tmp_missing_latest_open_refs AS
+            SELECT
+                t.instrument_id,
+                t.symbol,
+                t.exchange_name
+            FROM tmp_latest_open_symbol_refs t
+            LEFT JOIN symbol_reference_history srh
+              ON srh.instrument_id = t.instrument_id
+             AND srh.symbol = t.symbol
+             AND srh.effective_to IS NULL
+            WHERE srh.symbol IS NULL
+            """
+        )
 
         conn.execute(
             """
@@ -152,33 +188,47 @@ def run() -> None:
                 SELECT COALESCE(MAX(symbol_reference_history_id), 0) AS max_id
                 FROM symbol_reference_history
             ),
-            base AS (
+            staged AS (
                 SELECT
-                    i.instrument_id,
-                    u.symbol,
-                    u.exchange_name,
-                    ROW_NUMBER() OVER (ORDER BY u.symbol) AS rn
-                FROM tmp_nasdaq_latest_symbol_universe u
-                JOIN instrument i
-                    ON i.primary_ticker = u.symbol
+                    instrument_id,
+                    symbol,
+                    exchange_name,
+                    ROW_NUMBER() OVER (ORDER BY symbol, instrument_id) AS rn
+                FROM tmp_missing_latest_open_refs
             )
             SELECT
                 (SELECT max_id FROM current_max) + rn AS symbol_reference_history_id,
                 instrument_id,
                 symbol,
-                exchange_name,
+                exchange_name AS exchange,
                 TRUE AS is_primary,
-                CAST(substr(?, 1, 10) AS DATE) AS effective_from,
+                DATE '2026-03-29' AS effective_from,
                 NULL AS effective_to
-            FROM base
-            """,
-            [latest_snapshot_id],
+            FROM staged
+            """
         )
 
-        instrument_count = conn.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
+        instrument_count = conn.execute(
+            "SELECT COUNT(*) FROM instrument"
+        ).fetchone()[0]
         symbol_reference_count = conn.execute(
             "SELECT COUNT(*) FROM symbol_reference_history"
         ).fetchone()[0]
+        open_symbol_reference_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM symbol_reference_history
+            WHERE effective_to IS NULL
+            """
+        ).fetchone()[0]
+        by_security_type = conn.execute(
+            """
+            SELECT security_type, COUNT(*)
+            FROM instrument
+            GROUP BY security_type
+            ORDER BY security_type
+            """
+        ).fetchall()
 
         print(
             {
@@ -187,6 +237,8 @@ def run() -> None:
                 "latest_snapshot_id": latest_snapshot_id,
                 "instrument_count": instrument_count,
                 "symbol_reference_history_count": symbol_reference_count,
+                "open_symbol_reference_count": open_symbol_reference_count,
+                "instrument_rows_by_security_type": by_security_type,
             }
         )
     finally:

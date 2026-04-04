@@ -1,11 +1,12 @@
 """
-Enrich instrument and symbol_reference_history from targeted SEC symbol hits.
+Enrich symbol_reference_history from the targeted SEC symbol map.
 
 Design:
 - SQL-first
-- only add missing symbols from sec_symbol_company_map_targeted
-- do not overwrite existing Nasdaq-derived mappings
-- keep this as a simple additive enrichment pass
+- additive only
+- current repo canonical schema only
+- no duplicate primary_ticker instruments
+- no duplicate open-ended symbol rows
 """
 
 from __future__ import annotations
@@ -19,34 +20,49 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run() -> None:
+    """
+    Add missing instruments / symbol references for targeted SEC symbols.
+
+    Important:
+    - this creates identities only for symbols absent from the current open
+      reference layer and absent from the instrument primary_ticker layer
+    - it does not overwrite existing identities
+    """
     configure_logging()
     LOGGER.info("enrich-symbol-reference-from-sec-targeted started")
 
     conn = connect_build_db()
     try:
-        # --------------------------------------------------------------
-        # Stage only SEC symbols that are not already present in the
-        # current symbol_reference_history.
-        # --------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_sec_missing_symbols")
+        conn.execute("DROP TABLE IF EXISTS tmp_sec_targeted_missing_symbols")
         conn.execute(
             """
-            CREATE TEMP TABLE tmp_sec_missing_symbols AS
+            CREATE TEMP TABLE tmp_sec_targeted_missing_symbols AS
+            WITH sec_scope AS (
+                SELECT DISTINCT
+                    symbol,
+                    company_name,
+                    exchange,
+                    cik
+                FROM sec_symbol_company_map_targeted
+                WHERE symbol IS NOT NULL
+                  AND symbol <> ''
+            )
             SELECT
                 s.symbol,
-                s.cik,
                 s.company_name,
-                COALESCE(s.exchange, 'UNKNOWN') AS exchange_name
-            FROM sec_symbol_company_map_targeted AS s
+                s.exchange,
+                s.cik
+            FROM sec_scope AS s
+            LEFT JOIN instrument AS i
+              ON i.primary_ticker = s.symbol
             LEFT JOIN symbol_reference_history AS srh
               ON srh.symbol = s.symbol
-            WHERE srh.symbol IS NULL
+             AND srh.effective_to IS NULL
+            WHERE i.instrument_id IS NULL
+              AND srh.symbol IS NULL
             """
         )
 
-        # --------------------------------------------------------------
-        # Insert missing instruments.
-        # --------------------------------------------------------------
         conn.execute(
             """
             INSERT INTO instrument (
@@ -63,26 +79,23 @@ def run() -> None:
             staged AS (
                 SELECT
                     symbol,
-                    cik,
                     company_name,
-                    exchange_name,
+                    exchange,
+                    cik,
                     ROW_NUMBER() OVER (ORDER BY symbol) AS rn
-                FROM tmp_sec_missing_symbols
+                FROM tmp_sec_targeted_missing_symbols
             )
             SELECT
                 (SELECT max_id FROM current_max) + rn AS instrument_id,
                 'COMMON_STOCK' AS security_type,
                 'SEC_' || COALESCE(cik, symbol) AS company_id,
                 symbol AS primary_ticker,
-                exchange_name AS primary_exchange
+                COALESCE(exchange, 'UNKNOWN') AS primary_exchange
             FROM staged
             """
         )
 
-        # --------------------------------------------------------------
-        # Insert missing symbol references.
-        # --------------------------------------------------------------
-        conn.execute(
+        added_rows = conn.execute(
             """
             INSERT INTO symbol_reference_history (
                 symbol_reference_history_id,
@@ -101,9 +114,9 @@ def run() -> None:
                 SELECT
                     i.instrument_id,
                     m.symbol,
-                    m.exchange_name,
+                    COALESCE(m.exchange, 'UNKNOWN') AS exchange_name,
                     ROW_NUMBER() OVER (ORDER BY m.symbol) AS rn
-                FROM tmp_sec_missing_symbols AS m
+                FROM tmp_sec_targeted_missing_symbols AS m
                 JOIN instrument AS i
                   ON i.primary_ticker = m.symbol
             )
@@ -111,23 +124,18 @@ def run() -> None:
                 (SELECT max_id FROM current_max) + rn AS symbol_reference_history_id,
                 instrument_id,
                 symbol,
-                exchange_name AS exchange,
+                exchange_name,
                 TRUE AS is_primary,
-                DATE '2026-03-29' AS effective_from,
+                CURRENT_DATE AS effective_from,
                 NULL AS effective_to
             FROM staged
+            RETURNING symbol
             """
-        )
+        ).fetchall()
 
-        added_symbol_count = conn.execute(
-            "SELECT COUNT(*) FROM tmp_sec_missing_symbols"
-        ).fetchone()[0]
-
-        instrument_count = conn.execute(
-            "SELECT COUNT(*) FROM instrument"
-        ).fetchone()[0]
-
-        symbol_reference_count = conn.execute(
+        added_symbol_count = len(added_rows)
+        instrument_count = conn.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
+        symbol_reference_history_count = conn.execute(
             "SELECT COUNT(*) FROM symbol_reference_history"
         ).fetchone()[0]
 
@@ -137,13 +145,12 @@ def run() -> None:
                 "job": "enrich-symbol-reference-from-sec-targeted",
                 "added_symbol_count": added_symbol_count,
                 "instrument_count": instrument_count,
-                "symbol_reference_history_count": symbol_reference_count,
+                "symbol_reference_history_count": symbol_reference_history_count,
             }
         )
     finally:
         conn.close()
-
-    LOGGER.info("enrich-symbol-reference-from-sec-targeted finished")
+        LOGGER.info("enrich-symbol-reference-from-sec-targeted finished")
 
 
 if __name__ == "__main__":

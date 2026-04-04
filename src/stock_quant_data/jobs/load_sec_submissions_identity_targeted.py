@@ -1,12 +1,17 @@
 """
-Load a targeted SEC submissions symbol/company map for the current unresolved worklist.
+Load targeted SEC submissions identity data only for current unresolved symbol
+worklist / probe workflow.
 
-Design:
-- SQL-first output tables
-- Python stays thin for archive / JSON iteration
-- write only to CURRENT canonical targeted tables:
-    sec_submissions_company_raw_targeted
-    sec_symbol_company_map_targeted
+Current canonical outputs modified:
+- sec_submissions_company_raw_targeted
+- sec_symbol_company_map_targeted
+
+Current canonical input:
+- unresolved_symbol_worklist
+
+Important:
+- this is intentionally a second narrower pass over the same latest zip
+- only current schema names
 """
 
 from __future__ import annotations
@@ -25,104 +30,89 @@ from stock_quant_data.db.connections import connect_build_db
 LOGGER = logging.getLogger(__name__)
 
 
-def _find_latest_zip(root: Path) -> Path:
+def _latest_zip_path(root: Path) -> Path:
     """
-    Return the latest submissions zip by modified time.
-
-    We keep the rule simple and deterministic.
+    Resolve the latest submissions zip from downloader mirror or local mirror.
     """
-    zips = sorted(root.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not zips:
-        raise FileNotFoundError(f"No submissions zip found in {root}")
-    return zips[0]
+    candidates = sorted(root.glob("*.zip"))
+    if not candidates:
+        raise FileNotFoundError(f"No submissions zip found under {root}")
+    return candidates[-1]
 
 
 def run() -> None:
     """
-    Build a targeted SEC mapping layer for unresolved worklist symbols only.
+    Load targeted SEC submissions identity rows for only currently relevant
+    unresolved symbols.
     """
     configure_logging()
     LOGGER.info("load-sec-submissions-identity-targeted started")
 
     settings = get_settings()
+    submissions_root = Path(settings.data_root).parent / "stock-quant-data-downloader" / "data" / "sec" / "submissions"
+    if not submissions_root.exists():
+        submissions_root = Path(settings.data_root) / "sec" / "submissions"
+
+    latest_zip = _latest_zip_path(submissions_root)
+
     conn = connect_build_db()
-
     try:
-        submissions_root = Path(settings.downloader_data_root) / "sec" / "submissions"
-        latest_zip = _find_latest_zip(submissions_root)
-
         # ------------------------------------------------------------------
-        # Determine the exact set of symbols worth scanning from the current
-        # unresolved worklist.
+        # Target set comes from current unresolved worklist.
         # ------------------------------------------------------------------
-        worklist_symbols = {
+        target_symbols = {
             row[0]
             for row in conn.execute(
-                """
-                SELECT DISTINCT raw_symbol
-                FROM unresolved_symbol_worklist
-                """
+                "SELECT DISTINCT raw_symbol FROM unresolved_symbol_worklist"
             ).fetchall()
         }
 
-        # Clean rebuild of targeted tables each run.
         conn.execute("DELETE FROM sec_submissions_company_raw_targeted")
         conn.execute("DELETE FROM sec_symbol_company_map_targeted")
 
         raw_rows: list[tuple] = []
-        map_rows: list[tuple] = []
+        symbol_rows: list[tuple] = []
 
         with zipfile.ZipFile(latest_zip, "r") as zf:
-            member_names = [
-                name for name in zf.namelist()
-                if name.lower().endswith(".json")
-            ]
+            members = sorted(
+                [name for name in zf.namelist() if name.lower().endswith(".json")]
+            )
 
             raw_id = 0
-            for member_name in tqdm(member_names, desc="sec_submissions_json", unit="json"):
-                with zf.open(member_name) as fh:
-                    payload = json.load(fh)
+            for member_name in tqdm(members, desc="01sec_submissions_json", unit="json"):
+                payload = json.loads(zf.read(member_name).decode("utf-8"))
 
-                cik = str(payload.get("cik", "")).strip() or None
-                company_name = payload.get("name")
                 tickers = payload.get("tickers") or []
                 exchanges = payload.get("exchanges") or []
-                sic = payload.get("sic")
-                sic_description = payload.get("sicDescription")
-                entity_type = payload.get("entityType")
 
-                # Skip files with no ticker overlap at all.
-                if not any(ticker in worklist_symbols for ticker in tickers):
+                matched_symbols = [symbol for symbol in tickers if symbol in target_symbols]
+                if not matched_symbols:
                     continue
 
-                # Persist one company-level targeted raw row.
                 raw_id += 1
+                cik = str(payload.get("cik", "")).strip()
+                company_name = payload.get("name", "")
+
                 raw_rows.append(
                     (
                         raw_id,
                         cik,
                         company_name,
-                        tickers[0] if tickers else None,
-                        exchanges[0] if exchanges else None,
-                        sic,
-                        sic_description,
-                        entity_type,
                         str(latest_zip),
                         member_name,
+                        json.dumps(payload, separators=(",", ":")),
                     )
                 )
 
-                # Persist only ticker rows actually relevant to the worklist.
-                for idx, ticker in enumerate(tickers):
-                    if ticker not in worklist_symbols:
+                for idx, symbol in enumerate(tickers):
+                    if symbol not in target_symbols:
                         continue
-
                     exchange = exchanges[idx] if idx < len(exchanges) else None
-                    map_rows.append(
+                    symbol_rows.append(
                         (
                             raw_id,
                             cik,
-                            ticker,
+                            symbol,
                             company_name,
                             exchange,
                             str(latest_zip),
@@ -137,20 +127,16 @@ def run() -> None:
                     raw_id,
                     cik,
                     company_name,
-                    ticker,
-                    exchange,
-                    sic,
-                    sic_description,
-                    entity_type,
                     source_zip_path,
-                    json_member_name
+                    json_member_name,
+                    raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 raw_rows,
             )
 
-        if map_rows:
+        if symbol_rows:
             conn.executemany(
                 """
                 INSERT INTO sec_symbol_company_map_targeted (
@@ -164,7 +150,7 @@ def run() -> None:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                map_rows,
+                symbol_rows,
             )
 
         company_row_count = conn.execute(
@@ -180,7 +166,7 @@ def run() -> None:
                 "status": "ok",
                 "job": "load-sec-submissions-identity-targeted",
                 "latest_zip": str(latest_zip),
-                "worklist_symbol_count": len(worklist_symbols),
+                "worklist_symbol_count": len(target_symbols),
                 "company_row_count": company_row_count,
                 "symbol_row_count": symbol_row_count,
             }

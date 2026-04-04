@@ -1,10 +1,12 @@
 """
-Initialize price raw / normalized / canonical price tables.
+Initialize raw/normalized price tables for the current loader schema.
 
-Design:
-- SQL-first
-- this job is intentionally idempotent
-- it creates the price tables if missing but does not try to rebuild contents
+Canonical current tables:
+- price_source_daily_raw_stooq
+- price_source_daily_raw_yahoo
+- price_source_daily_normalized
+
+This module must remain the single source of truth for these table contracts.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Ensure the price tables exist with canonical schemas.
+    Ensure current canonical price tables exist.
     """
     configure_logging()
     LOGGER.info("init-price-raw-tables started")
@@ -29,14 +31,14 @@ def run() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS price_source_daily_raw_stooq (
-                source_row_id BIGINT,
-                raw_symbol VARCHAR,
-                price_date DATE,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                volume BIGINT
+                raw_price_id BIGINT PRIMARY KEY,
+                raw_symbol VARCHAR NOT NULL,
+                price_date DATE NOT NULL,
+                open DOUBLE NOT NULL,
+                high DOUBLE NOT NULL,
+                low DOUBLE NOT NULL,
+                close DOUBLE NOT NULL,
+                volume BIGINT NOT NULL
             )
             """
         )
@@ -44,15 +46,15 @@ def run() -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS price_source_daily_raw_yahoo (
-                source_row_id BIGINT,
-                raw_symbol VARCHAR,
-                price_date DATE,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
+                raw_price_id BIGINT PRIMARY KEY,
+                raw_symbol VARCHAR NOT NULL,
+                price_date DATE NOT NULL,
+                open DOUBLE NOT NULL,
+                high DOUBLE NOT NULL,
+                low DOUBLE NOT NULL,
+                close DOUBLE NOT NULL,
                 adj_close DOUBLE,
-                volume BIGINT
+                volume BIGINT NOT NULL
             )
             """
         )
@@ -79,26 +81,6 @@ def run() -> None:
             """
         )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS price_history (
-                price_history_id BIGINT PRIMARY KEY,
-                instrument_id BIGINT,
-                symbol VARCHAR,
-                source_name VARCHAR,
-                source_row_id BIGINT,
-                price_date DATE,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                adj_close DOUBLE,
-                volume BIGINT,
-                built_at TIMESTAMP
-            )
-            """
-        )
-
         print(
             {
                 "status": "ok",
@@ -107,7 +89,6 @@ def run() -> None:
                     "price_source_daily_raw_stooq",
                     "price_source_daily_raw_yahoo",
                     "price_source_daily_normalized",
-                    "price_history",
                 ],
             }
         )

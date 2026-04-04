@@ -1,129 +1,96 @@
 """
-Load staged SEC companyfacts JSON files into DuckDB using a SQL-first approach.
+Load staged SEC companyfacts JSON files into the canonical raw table.
 
-Why this job exists:
-- DuckDB is very good at reading JSON and multiple files directly in SQL.
-- We want Python to remain thin here.
-- The staging job already moved ZIP complexity out of the ingestion step.
+Current canonical target:
+- sec_companyfacts_raw
 
-Design:
-- Read all staged JSON files from:
-    data/staging/sec/companyfacts/*/*.json
-- Build sec_companyfacts_raw in DuckDB from read_json_auto().
-- Preserve full lineage:
-    - source_snapshot_id
-    - source_json_path
-- Preserve the nested facts object as JSON text in facts_json.
-
-Important:
-- This is still a RAW layer.
-- It does not explode facts into a fact-level table yet.
-- The table is rebuilt on each run for deterministic behavior during refactor.
+Staging source:
+- <data_root>/sec/companyfacts_staged/*.json
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
+from tqdm import tqdm
+
 from stock_quant_data.config.logging import configure_logging
+from stock_quant_data.config.settings import get_settings
 from stock_quant_data.db.connections import connect_build_db
 
 LOGGER = logging.getLogger(__name__)
 
-STAGING_ROOT = Path(
-    "/home/marty/stock-quant-data-loader/data/staging/sec/companyfacts"
-)
-STAGING_GLOB = str(STAGING_ROOT / "*" / "*.json")
-
-DUCKDB_THREADS = 8
-
 
 def run() -> None:
     """
-    Build sec_companyfacts_raw from staged JSON files using DuckDB SQL.
+    Read staged companyfacts json files and load them into sec_companyfacts_raw.
     """
     configure_logging()
     LOGGER.info("load-sec-companyfacts-raw-from-staged-json started")
 
-    if not STAGING_ROOT.exists():
-        raise FileNotFoundError(
-            f"Staging root does not exist: {STAGING_ROOT}"
-        )
+    settings = get_settings()
+    stage_dir = Path(settings.data_root) / "sec" / "companyfacts_staged"
+
+    if not stage_dir.exists():
+        raise FileNotFoundError(f"Staging directory not found: {stage_dir}")
+
+    files = sorted(stage_dir.glob("*.json"))
 
     conn = connect_build_db()
     try:
-        conn.execute(f"PRAGMA threads={DUCKDB_THREADS}")
-        conn.execute("DROP TABLE IF EXISTS sec_companyfacts_raw")
+        conn.execute("DELETE FROM sec_companyfacts_raw")
 
-        conn.execute(
-            f"""
-            CREATE TABLE sec_companyfacts_raw AS
-            WITH staged AS (
-                SELECT
-                    filename AS source_json_path,
-                    regexp_extract(
-                        filename,
-                        '.*/companyfacts/([^/]+)/[^/]+\\.json$',
-                        1
-                    ) AS source_snapshot_id,
-                    regexp_extract(
-                        filename,
-                        '.*/([^/]+\\.json)$',
-                        1
-                    ) AS json_member_name,
-                    CAST(cik AS VARCHAR) AS cik,
-                    CAST(entityName AS VARCHAR) AS entity_name,
-                    CAST(to_json(facts) AS VARCHAR) AS facts_json
-                FROM read_json_auto(
-                    '{STAGING_GLOB}',
-                    filename = true,
-                    union_by_name = true
+        rows: list[tuple] = []
+        raw_id = 0
+
+        for file_path in tqdm(files, desc="sec_companyfacts_load", unit="json"):
+            payload = json.loads(file_path.read_text(encoding="utf-8"))
+            raw_id += 1
+
+            rows.append(
+                (
+                    raw_id,
+                    str(payload.get("cik", "")).strip(),
+                    payload.get("entityName", "") or payload.get("entity_name", ""),
+                    str(file_path),
+                    file_path.name,
+                    json.dumps(payload, separators=(",", ":")),
                 )
             )
-            SELECT
-                ROW_NUMBER() OVER (
-                    ORDER BY source_snapshot_id, json_member_name, source_json_path
-                ) AS raw_id,
-                source_snapshot_id,
-                source_json_path,
-                json_member_name,
-                COALESCE(cik, '') AS cik,
-                COALESCE(entity_name, '') AS entity_name,
-                COALESCE(facts_json, '{{}}') AS facts_json,
-                CURRENT_TIMESTAMP AS loaded_at
-            FROM staged
-            """
-        )
+
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO sec_companyfacts_raw (
+                    raw_id,
+                    cik,
+                    entity_name,
+                    source_zip_path,
+                    json_member_name,
+                    raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
 
         row_count = conn.execute(
             "SELECT COUNT(*) FROM sec_companyfacts_raw"
-        ).fetchone()[0]
-
-        distinct_cik_count = conn.execute(
-            "SELECT COUNT(DISTINCT cik) FROM sec_companyfacts_raw"
-        ).fetchone()[0]
-
-        snapshot_count = conn.execute(
-            "SELECT COUNT(DISTINCT source_snapshot_id) FROM sec_companyfacts_raw"
         ).fetchone()[0]
 
         print(
             {
                 "status": "ok",
                 "job": "load-sec-companyfacts-raw-from-staged-json",
-                "staging_root": str(STAGING_ROOT),
-                "staging_glob": STAGING_GLOB,
                 "row_count": row_count,
-                "distinct_cik_count": distinct_cik_count,
-                "snapshot_count": snapshot_count,
-                "duckdb_threads": DUCKDB_THREADS,
+                "stage_dir": str(stage_dir),
             }
         )
     finally:
         conn.close()
-
-    LOGGER.info("load-sec-companyfacts-raw-from-staged-json finished")
+        LOGGER.info("load-sec-companyfacts-raw-from-staged-json finished")
 
 
 if __name__ == "__main__":

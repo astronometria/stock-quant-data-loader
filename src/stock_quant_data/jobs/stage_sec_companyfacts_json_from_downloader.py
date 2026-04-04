@@ -1,130 +1,87 @@
 """
-Stage SEC companyfacts JSON files from downloader ZIP archives onto local disk.
+Stage SEC companyfacts JSON members from downloader artifacts into a local
+filesystem staging directory.
 
 Why this job exists:
-- The downloader repo stores SEC companyfacts as ZIP archives.
-- The loader repo should work SQL-first from staged JSON files.
-- This job keeps Python very thin: it only performs archive discovery and extraction.
+- it decouples raw zip reading from DB insertion
+- it keeps Python thin: unzip + write staged json
+- later loader jobs can read staged files deterministically
 
-Design:
-- Extract every companyfacts ZIP found under the downloader root.
-- Each ZIP is extracted into its own snapshot directory:
-    data/staging/sec/companyfacts/<snapshot_id>/
-- The snapshot_id is derived from the ZIP filename stem with the "_companyfacts" suffix removed.
-- Existing staged snapshot directories are replaced so reruns stay deterministic.
-
-Important:
-- This is a staging step only.
-- It does not parse the JSON payloads.
-- It does not write to DuckDB.
+Current canonical downstream target:
+- load_sec_companyfacts_raw_from_staged_json.py
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import shutil
 import zipfile
 from pathlib import Path
 
 from tqdm import tqdm
 
 from stock_quant_data.config.logging import configure_logging
+from stock_quant_data.config.settings import get_settings
 
 LOGGER = logging.getLogger(__name__)
 
-# Downloader handoff boundary.
-DOWNLOADER_COMPANYFACTS_ROOT = Path(
-    "/home/marty/stock-quant-data-downloader/data/sec/companyfacts"
-)
 
-# Loader-local staging root.
-STAGING_ROOT = Path(
-    "/home/marty/stock-quant-data-loader/data/staging/sec/companyfacts"
-)
-
-
-def snapshot_id_from_zip_path(zip_path: Path) -> str:
+def _latest_zip_path(root: Path) -> Path:
     """
-    Derive a stable snapshot id from the ZIP filename.
-
-    Example:
-    2026-03-29T03-18-32-857281Z_46bd7ae3_companyfacts.zip
-    ->
-    2026-03-29T03-18-32-857281Z_46bd7ae3
+    Return the latest companyfacts zip path.
     """
-    name = zip_path.name
-    suffix = "_companyfacts.zip"
-    if name.endswith(suffix):
-        return name[: -len(suffix)]
-    return zip_path.stem
+    candidates = sorted(root.glob("*.zip"))
+    if not candidates:
+        raise FileNotFoundError(f"No companyfacts zip found under {root}")
+    return candidates[-1]
 
 
 def run() -> None:
     """
-    Extract companyfacts ZIP archives into versioned staging folders.
+    Extract companyfacts json members into the local staging directory.
     """
     configure_logging()
     LOGGER.info("stage-sec-companyfacts-json-from-downloader started")
 
-    if not DOWNLOADER_COMPANYFACTS_ROOT.exists():
-        raise FileNotFoundError(
-            f"Downloader companyfacts root does not exist: {DOWNLOADER_COMPANYFACTS_ROOT}"
-        )
+    settings = get_settings()
 
-    STAGING_ROOT.mkdir(parents=True, exist_ok=True)
+    downloader_root = Path(settings.data_root).parent / "stock-quant-data-downloader" / "data" / "sec" / "companyfacts"
+    if not downloader_root.exists():
+        downloader_root = Path(settings.data_root) / "sec" / "companyfacts"
 
-    zip_paths = sorted(
-        path
-        for path in DOWNLOADER_COMPANYFACTS_ROOT.glob("*.zip")
-        if path.is_file()
-    )
+    latest_zip = _latest_zip_path(downloader_root)
 
-    extracted_snapshot_count = 0
-    extracted_json_count = 0
+    stage_dir = Path(settings.data_root) / "sec" / "companyfacts_staged"
+    stage_dir.mkdir(parents=True, exist_ok=True)
 
-    for zip_path in tqdm(
-        zip_paths,
-        desc="sec_companyfacts_zip",
-        unit="zip",
-        dynamic_ncols=True,
-        leave=True,
-    ):
-        snapshot_id = snapshot_id_from_zip_path(zip_path)
-        snapshot_stage_dir = STAGING_ROOT / snapshot_id
+    # Clean current staged json files for deterministic rebuild behavior.
+    for path in stage_dir.glob("*.json"):
+        path.unlink()
 
-        # Deterministic rerun behavior.
-        if snapshot_stage_dir.exists():
-            shutil.rmtree(snapshot_stage_dir)
-        snapshot_stage_dir.mkdir(parents=True, exist_ok=True)
+    staged_count = 0
 
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            members = sorted(
-                name
-                for name in zf.namelist()
-                if name.lower().endswith(".json")
-            )
+    with zipfile.ZipFile(latest_zip, "r") as zf:
+        members = sorted([name for name in zf.namelist() if name.lower().endswith(".json")])
 
-            for member_name in tqdm(
-                members,
-                desc=f"extract:{snapshot_id}",
-                unit="json",
-                dynamic_ncols=True,
-                leave=False,
-            ):
-                zf.extract(member_name, path=snapshot_stage_dir)
-                extracted_json_count += 1
+        for member_name in tqdm(members, desc="sec_companyfacts_stage", unit="json"):
+            payload = json.loads(zf.read(member_name).decode("utf-8"))
 
-        extracted_snapshot_count += 1
+            # Keep a simple flat filename that remains stable and filesystem-safe.
+            cik = str(payload.get("cik", "")).strip() or "UNKNOWN"
+            out_path = stage_dir / f"{cik}_{Path(member_name).name}"
+
+            with out_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, separators=(",", ":"))
+
+            staged_count += 1
 
     print(
         {
             "status": "ok",
             "job": "stage-sec-companyfacts-json-from-downloader",
-            "downloader_root": str(DOWNLOADER_COMPANYFACTS_ROOT),
-            "staging_root": str(STAGING_ROOT),
-            "zip_count": len(zip_paths),
-            "snapshot_count": extracted_snapshot_count,
-            "json_count": extracted_json_count,
+            "latest_zip": str(latest_zip),
+            "stage_dir": str(stage_dir),
+            "staged_count": staged_count,
         }
     )
 

@@ -1,10 +1,19 @@
 """
-Build a compact worklist from the unresolved symbol candidate table.
+Build the current unresolved symbol worklist.
 
-Design:
-- SQL-first
-- only actionable unresolved rows
-- canonical output schema
+Current canonical input:
+- symbol_reference_candidates_from_unresolved_stooq
+
+Current canonical output:
+- unresolved_symbol_worklist
+
+The worklist intentionally excludes:
+- pure format-only mapping tasks
+- low-volume later-review tasks
+
+It keeps:
+- REVIEW_FOR_REFERENCE_IDENTITY_CREATION
+- REVIEW_FOR_REFERENCE_IDENTITY_CREATION_HIGH_PRIORITY
 """
 
 from __future__ import annotations
@@ -19,17 +28,27 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Rebuild unresolved_symbol_worklist.
+    Rebuild unresolved_symbol_worklist from current candidate rows.
     """
     configure_logging()
     LOGGER.info("build-unresolved-symbol-worklist started")
 
     conn = connect_build_db()
     try:
-        conn.execute("DROP TABLE IF EXISTS unresolved_symbol_worklist")
+        conn.execute("DELETE FROM unresolved_symbol_worklist")
+
         conn.execute(
             """
-            CREATE TABLE unresolved_symbol_worklist AS
+            INSERT INTO unresolved_symbol_worklist (
+                raw_symbol,
+                unresolved_row_count,
+                min_price_date,
+                max_price_date,
+                candidate_family,
+                suggested_action,
+                recency_bucket,
+                built_at
+            )
             SELECT
                 raw_symbol,
                 unresolved_row_count,
@@ -38,7 +57,7 @@ def run() -> None:
                 candidate_family,
                 suggested_action,
                 recency_bucket,
-                CURRENT_TIMESTAMP AS built_at
+                NOW() AS built_at
             FROM symbol_reference_candidates_from_unresolved_stooq
             WHERE suggested_action IN (
                 'REVIEW_FOR_REFERENCE_IDENTITY_CREATION',

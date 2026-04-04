@@ -1,151 +1,99 @@
 """
-Load SEC submissions identity fields from the latest downloader submissions ZIP.
+Load broad SEC submissions identity data from downloader artifacts.
 
-Scope of this first loader:
-- read only the latest submissions.zip from downloader storage
-- extract identity-relevant fields only
-- write a raw company-level table
-- explode a simple symbol map staging table
+Current canonical outputs modified:
+- sec_submissions_company_raw
+- sec_symbol_company_map
 
-Why this shape:
-- keep Python thin and focused on ZIP + JSON reading
-- keep downstream joins and analysis SQL-first in DuckDB
+Important:
+- only current table names
+- raw_id generation is deterministic inside a fresh rebuild
+- loader reads zip produced by downloader repo, but does not assume old repo names
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import zipfile
 from pathlib import Path
 
+from tqdm import tqdm
+
 from stock_quant_data.config.logging import configure_logging
+from stock_quant_data.config.settings import get_settings
 from stock_quant_data.db.connections import connect_build_db
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_SUBMISSIONS_ROOT = Path("/home/marty/stock-quant-data-downloader/data/sec/submissions")
+
+def _latest_zip_path(root: Path) -> Path:
+    """
+    Resolve the latest submissions zip from the downloader mirror.
+    """
+    candidates = sorted(root.glob("*.zip"))
+    if not candidates:
+        raise FileNotFoundError(f"No submissions zip found under {root}")
+    return candidates[-1]
 
 
-def run(submissions_root: str | None = None) -> None:
+def run() -> None:
+    """
+    Load broad SEC submissions company raw rows and extracted symbol mappings.
+    """
     configure_logging()
     LOGGER.info("load-sec-submissions-identity-from-downloader started")
 
-    root = Path(submissions_root) if submissions_root else DEFAULT_SUBMISSIONS_ROOT
-    if not root.exists():
-        raise FileNotFoundError(f"SEC submissions root does not exist: {root}")
+    settings = get_settings()
+    submissions_root = Path(settings.data_root).parent / "stock-quant-data-downloader" / "data" / "sec" / "submissions"
 
-    zip_files = sorted(root.glob("*.zip"))
-    if not zip_files:
-        raise RuntimeError(f"No submissions zip found under {root}")
+    # Fallback: local colocated data path inside current repo, if present.
+    if not submissions_root.exists():
+        submissions_root = Path(settings.data_root) / "sec" / "submissions"
 
-    latest_zip = zip_files[-1]
+    latest_zip = _latest_zip_path(submissions_root)
 
     conn = connect_build_db()
     try:
-        # --------------------------------------------------------------
-        # Raw company-level identity staging.
-        # We keep JSON arrays serialized as JSON text to preserve raw shape.
-        # --------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS sec_submissions_company_raw")
-        conn.execute(
-            """
-            CREATE TABLE sec_submissions_company_raw (
-                raw_id BIGINT,
-                source_zip_path VARCHAR NOT NULL,
-                json_member_name VARCHAR NOT NULL,
-                cik VARCHAR,
-                company_name VARCHAR,
-                tickers_json VARCHAR,
-                exchanges_json VARCHAR,
-                former_names_json VARCHAR,
-                sic VARCHAR,
-                sic_description VARCHAR,
-                entity_type VARCHAR,
-                loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        conn.execute("DELETE FROM sec_submissions_company_raw")
+        conn.execute("DELETE FROM sec_symbol_company_map")
+
+        raw_rows: list[tuple] = []
+        symbol_rows: list[tuple] = []
+
+        with zipfile.ZipFile(latest_zip, "r") as zf:
+            members = sorted(
+                [name for name in zf.namelist() if name.lower().endswith(".json")]
             )
-            """
-        )
 
-        # --------------------------------------------------------------
-        # Symbol-level exploded staging.
-        # One row per (cik, symbol) from SEC submissions current tickers.
-        # --------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS sec_symbol_company_map")
-        conn.execute(
-            """
-            CREATE TABLE sec_symbol_company_map (
-                raw_id BIGINT,
-                cik VARCHAR,
-                symbol VARCHAR,
-                company_name VARCHAR,
-                exchange VARCHAR,
-                source_zip_path VARCHAR NOT NULL,
-                json_member_name VARCHAR NOT NULL,
-                loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+            raw_id = 0
+            for member_name in tqdm(members, desc="sec_submissions_json", unit="json"):
+                payload = json.loads(zf.read(member_name).decode("utf-8"))
+                raw_id += 1
 
-        company_rows = []
-        symbol_rows = []
+                cik = str(payload.get("cik", "")).strip()
+                company_name = payload.get("name", "")
 
-        with zipfile.ZipFile(latest_zip) as zf:
-            json_names = [n for n in zf.namelist() if n.endswith(".json")]
-
-            raw_company_id = 1
-            raw_symbol_id = 1
-
-            for member_name in json_names:
-                with zf.open(member_name) as fh:
-                    try:
-                        obj = json.load(fh)
-                    except Exception:
-                        # Skip malformed JSON members defensively in this first pass.
-                        continue
-
-                cik = str(obj.get("cik", "")).strip() or None
-                company_name = obj.get("name")
-                tickers = obj.get("tickers") or []
-                exchanges = obj.get("exchanges") or []
-                former_names = obj.get("formerNames") or []
-                sic = obj.get("sic")
-                sic_description = obj.get("sicDescription")
-                entity_type = obj.get("entityType")
-
-                company_rows.append(
+                raw_rows.append(
                     (
-                        raw_company_id,
-                        str(latest_zip),
-                        member_name,
+                        raw_id,
                         cik,
                         company_name,
-                        json.dumps(tickers, ensure_ascii=False),
-                        json.dumps(exchanges, ensure_ascii=False),
-                        json.dumps(former_names, ensure_ascii=False),
-                        sic,
-                        sic_description,
-                        entity_type,
+                        str(latest_zip),
+                        member_name,
+                        json.dumps(payload, separators=(",", ":")),
                     )
                 )
-                raw_company_id += 1
 
-                # ------------------------------------------------------
-                # Explode current tickers. Keep pairwise alignment with
-                # exchanges when lengths match, else leave exchange NULL.
-                # ------------------------------------------------------
-                for i, symbol in enumerate(tickers):
-                    symbol = str(symbol).strip()
-                    if not symbol:
-                        continue
+                tickers = payload.get("tickers") or []
+                exchanges = payload.get("exchanges") or []
 
-                    exchange = None
-                    if i < len(exchanges):
-                        exchange = exchanges[i]
-
+                for idx, symbol in enumerate(tickers):
+                    exchange = exchanges[idx] if idx < len(exchanges) else None
                     symbol_rows.append(
                         (
-                            raw_symbol_id,
+                            raw_id,
                             cik,
                             symbol,
                             company_name,
@@ -154,27 +102,21 @@ def run(submissions_root: str | None = None) -> None:
                             member_name,
                         )
                     )
-                    raw_symbol_id += 1
 
-        if company_rows:
+        if raw_rows:
             conn.executemany(
                 """
                 INSERT INTO sec_submissions_company_raw (
                     raw_id,
-                    source_zip_path,
-                    json_member_name,
                     cik,
                     company_name,
-                    tickers_json,
-                    exchanges_json,
-                    former_names_json,
-                    sic,
-                    sic_description,
-                    entity_type
+                    source_zip_path,
+                    json_member_name,
+                    raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                company_rows,
+                raw_rows,
             )
 
         if symbol_rows:
@@ -194,11 +136,11 @@ def run(submissions_root: str | None = None) -> None:
                 symbol_rows,
             )
 
-        company_count = conn.execute(
+        company_row_count = conn.execute(
             "SELECT COUNT(*) FROM sec_submissions_company_raw"
         ).fetchone()[0]
 
-        symbol_count = conn.execute(
+        symbol_row_count = conn.execute(
             "SELECT COUNT(*) FROM sec_symbol_company_map"
         ).fetchone()[0]
 
@@ -207,14 +149,13 @@ def run(submissions_root: str | None = None) -> None:
                 "status": "ok",
                 "job": "load-sec-submissions-identity-from-downloader",
                 "latest_zip": str(latest_zip),
-                "company_row_count": company_count,
-                "symbol_row_count": symbol_count,
+                "company_row_count": company_row_count,
+                "symbol_row_count": symbol_row_count,
             }
         )
     finally:
         conn.close()
-
-    LOGGER.info("load-sec-submissions-identity-from-downloader finished")
+        LOGGER.info("load-sec-submissions-identity-from-downloader finished")
 
 
 if __name__ == "__main__":

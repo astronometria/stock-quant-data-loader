@@ -1,243 +1,153 @@
 """
-Fast SQL-first loader for Nasdaq Trader symbol directory snapshots.
+Load Nasdaq symbol directory raw snapshots from downloader artifacts.
+
+Current canonical target:
+- nasdaq_symbol_directory_raw
+
+Expected downloader artifact shape:
+- one or more CSV files and/or zip payloads placed under the downloader repo
+  data mirror
+
+This loader stays intentionally tolerant:
+- it accepts .csv and .zip
+- for .zip it loads every .csv member found inside
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
+import zipfile
 from pathlib import Path
 
+from tqdm import tqdm
+
 from stock_quant_data.config.logging import configure_logging
+from stock_quant_data.config.settings import get_settings
 from stock_quant_data.db.connections import connect_build_db
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_ROOT = "/home/marty/stock-quant-data-downloader/data/nasdaq/symdir"
+
+def _candidate_paths(root: Path) -> list[Path]:
+    """
+    Return all loadable Nasdaq raw artifacts in stable sorted order.
+    """
+    candidates = sorted(root.glob("*.csv")) + sorted(root.glob("*.zip"))
+    if not candidates:
+        raise FileNotFoundError(f"No Nasdaq symbol directory artifacts found under {root}")
+    return candidates
 
 
-def sql_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+def _snapshot_id_from_name(path_name: str) -> str:
+    """
+    Derive a snapshot_id from filename.
+
+    We keep this simple and deterministic: the stem becomes the snapshot_id.
+    """
+    return Path(path_name).stem
 
 
-def run(root_path: str | None = None) -> None:
+def run() -> None:
+    """
+    Load raw Nasdaq symbol directory snapshot rows.
+    """
     configure_logging()
     LOGGER.info("load-nasdaq-symbol-directory-raw-from-downloader started")
 
-    root = Path(root_path or DEFAULT_ROOT)
-    if not root.exists():
-        raise FileNotFoundError(f"Nasdaq symdir root does not exist: {root}")
+    settings = get_settings()
+    downloader_root = Path(settings.data_root).parent / "stock-quant-data-downloader" / "data" / "nasdaq"
+    if not downloader_root.exists():
+        downloader_root = Path(settings.data_root) / "nasdaq"
 
-    nasdaqlisted_files = sorted(
-        str(p) for p in root.iterdir()
-        if p.is_file() and p.name.endswith("_nasdaqlisted.txt")
-    )
-    otherlisted_files = sorted(
-        str(p) for p in root.iterdir()
-        if p.is_file() and p.name.endswith("_otherlisted.txt")
-    )
-
-    if not nasdaqlisted_files and not otherlisted_files:
-        raise RuntimeError(f"No nasdaqlisted/otherlisted files found under {root}")
+    artifact_paths = _candidate_paths(downloader_root)
 
     conn = connect_build_db()
     try:
-        conn.execute("DROP TABLE IF EXISTS nasdaq_symbol_directory_raw")
+        conn.execute("DELETE FROM nasdaq_symbol_directory_raw")
 
-        conn.execute(
-            """
-            CREATE TABLE nasdaq_symbol_directory_raw (
-                raw_id BIGINT,
-                snapshot_file VARCHAR NOT NULL,
-                snapshot_id VARCHAR NOT NULL,
-                source_kind VARCHAR NOT NULL,
-                symbol VARCHAR,
-                security_name VARCHAR,
-                exchange_code VARCHAR,
-                market_category VARCHAR,
-                cqs_symbol VARCHAR,
-                nasdaq_symbol VARCHAR,
-                financial_status VARCHAR,
-                round_lot_size BIGINT,
-                etf_flag VARCHAR,
-                nextshares_flag VARCHAR,
-                test_issue_flag VARCHAR,
-                raw_lineage VARCHAR,
-                loaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+        rows: list[tuple] = []
+        raw_id = 0
 
-        next_id = 1
+        for artifact_path in artifact_paths:
+            if artifact_path.suffix.lower() == ".csv":
+                with artifact_path.open("r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in tqdm(list(reader), desc=f"nasdaq_csv:{artifact_path.name}", unit="row"):
+                        raw_id += 1
+                        rows.append(
+                            (
+                                raw_id,
+                                _snapshot_id_from_name(artifact_path.name),
+                                row.get("source_kind", "csv"),
+                                row.get("symbol"),
+                                row.get("security_name") or row.get("Security Name"),
+                                row.get("exchange_code") or row.get("Market Category"),
+                                row.get("test_issue_flag") or row.get("Test Issue"),
+                                row.get("etf_flag") or row.get("ETF"),
+                                None,
+                                str(row),
+                            )
+                        )
 
-        if nasdaqlisted_files:
-            files_sql = "[" + ", ".join(sql_quote(p) for p in nasdaqlisted_files) + "]"
-            sql = f"""
-            INSERT INTO nasdaq_symbol_directory_raw (
-                raw_id,
-                snapshot_file,
-                snapshot_id,
-                source_kind,
-                symbol,
-                security_name,
-                exchange_code,
-                market_category,
-                cqs_symbol,
-                nasdaq_symbol,
-                financial_status,
-                round_lot_size,
-                etf_flag,
-                nextshares_flag,
-                test_issue_flag,
-                raw_lineage,
-                loaded_at
-            )
-            SELECT
-                {next_id} - 1 + row_number() OVER () AS raw_id,
-                filename AS snapshot_file,
-                regexp_extract(filename, '/([^/]+)_(nasdaqlisted|otherlisted)\\.txt$', 1) AS snapshot_id,
-                'nasdaqlisted' AS source_kind,
-                "Symbol" AS symbol,
-                "Security Name" AS security_name,
-                'Q' AS exchange_code,
-                "Market Category" AS market_category,
-                NULL AS cqs_symbol,
-                "Symbol" AS nasdaq_symbol,
-                "Financial Status" AS financial_status,
-                TRY_CAST("Round Lot Size" AS BIGINT) AS round_lot_size,
-                "ETF" AS etf_flag,
-                "NextShares" AS nextshares_flag,
-                "Test Issue" AS test_issue_flag,
-                'nasdaqlisted' AS raw_lineage,
-                current_timestamp AS loaded_at
-            FROM read_csv(
-                {files_sql},
-                delim='|',
-                header=true,
-                auto_detect=false,
-                filename=true,
-                ignore_errors=true,
-                null_padding=true,
-                columns={{
-                    'Symbol': 'VARCHAR',
-                    'Security Name': 'VARCHAR',
-                    'Market Category': 'VARCHAR',
-                    'Test Issue': 'VARCHAR',
-                    'Financial Status': 'VARCHAR',
-                    'Round Lot Size': 'VARCHAR',
-                    'ETF': 'VARCHAR',
-                    'NextShares': 'VARCHAR'
-                }}
-            )
-            WHERE "Symbol" IS NOT NULL
-              AND "Symbol" <> ''
-              AND "Symbol" <> 'File Creation Time'
-            """
-            conn.execute(sql)
-            next_id = conn.execute("SELECT COALESCE(MAX(raw_id), 0) + 1 FROM nasdaq_symbol_directory_raw").fetchone()[0]
+            elif artifact_path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(artifact_path, "r") as zf:
+                    members = sorted([name for name in zf.namelist() if name.lower().endswith(".csv")])
+                    for member_name in members:
+                        reader = csv.DictReader(io.StringIO(zf.read(member_name).decode("utf-8")))
+                        for row in tqdm(list(reader), desc=f"nasdaq_zip:{Path(member_name).name}", unit="row"):
+                            raw_id += 1
+                            rows.append(
+                                (
+                                    raw_id,
+                                    _snapshot_id_from_name(artifact_path.name),
+                                    row.get("source_kind", Path(member_name).stem),
+                                    row.get("symbol"),
+                                    row.get("security_name") or row.get("Security Name"),
+                                    row.get("exchange_code") or row.get("Market Category"),
+                                    row.get("test_issue_flag") or row.get("Test Issue"),
+                                    row.get("etf_flag") or row.get("ETF"),
+                                    None,
+                                    str(row),
+                                )
+                            )
 
-        if otherlisted_files:
-            files_sql = "[" + ", ".join(sql_quote(p) for p in otherlisted_files) + "]"
-            sql = f"""
-            INSERT INTO nasdaq_symbol_directory_raw (
-                raw_id,
-                snapshot_file,
-                snapshot_id,
-                source_kind,
-                symbol,
-                security_name,
-                exchange_code,
-                market_category,
-                cqs_symbol,
-                nasdaq_symbol,
-                financial_status,
-                round_lot_size,
-                etf_flag,
-                nextshares_flag,
-                test_issue_flag,
-                raw_lineage,
-                loaded_at
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO nasdaq_symbol_directory_raw (
+                    raw_id,
+                    snapshot_id,
+                    source_kind,
+                    symbol,
+                    security_name,
+                    exchange_code,
+                    test_issue_flag,
+                    etf_flag,
+                    round_lot_size,
+                    raw_payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
             )
-            SELECT
-                {next_id} - 1 + row_number() OVER () AS raw_id,
-                filename AS snapshot_file,
-                regexp_extract(filename, '/([^/]+)_(nasdaqlisted|otherlisted)\\.txt$', 1) AS snapshot_id,
-                'otherlisted' AS source_kind,
-                "ACT Symbol" AS symbol,
-                "Security Name" AS security_name,
-                "Exchange" AS exchange_code,
-                NULL AS market_category,
-                "CQS Symbol" AS cqs_symbol,
-                "NASDAQ Symbol" AS nasdaq_symbol,
-                NULL AS financial_status,
-                TRY_CAST("Round Lot Size" AS BIGINT) AS round_lot_size,
-                "ETF" AS etf_flag,
-                NULL AS nextshares_flag,
-                "Test Issue" AS test_issue_flag,
-                'otherlisted' AS raw_lineage,
-                current_timestamp AS loaded_at
-            FROM read_csv(
-                {files_sql},
-                delim='|',
-                header=true,
-                auto_detect=false,
-                filename=true,
-                ignore_errors=true,
-                null_padding=true,
-                columns={{
-                    'ACT Symbol': 'VARCHAR',
-                    'Security Name': 'VARCHAR',
-                    'Exchange': 'VARCHAR',
-                    'CQS Symbol': 'VARCHAR',
-                    'ETF': 'VARCHAR',
-                    'Round Lot Size': 'VARCHAR',
-                    'Test Issue': 'VARCHAR',
-                    'NASDAQ Symbol': 'VARCHAR'
-                }}
-            )
-            WHERE "ACT Symbol" IS NOT NULL
-              AND "ACT Symbol" <> ''
-              AND "ACT Symbol" <> 'File Creation Time'
-            """
-            conn.execute(sql)
 
-        total_rows = conn.execute(
+        row_count = conn.execute(
             "SELECT COUNT(*) FROM nasdaq_symbol_directory_raw"
         ).fetchone()[0]
-
-        by_kind = conn.execute(
-            """
-            SELECT source_kind, COUNT(*)
-            FROM nasdaq_symbol_directory_raw
-            GROUP BY source_kind
-            ORDER BY source_kind
-            """
-        ).fetchall()
-
-        snapshots = conn.execute(
-            """
-            SELECT snapshot_id, source_kind, COUNT(*)
-            FROM nasdaq_symbol_directory_raw
-            GROUP BY snapshot_id, source_kind
-            ORDER BY snapshot_id, source_kind
-            """
-        ).fetchall()
 
         print(
             {
                 "status": "ok",
                 "job": "load-nasdaq-symbol-directory-raw-from-downloader",
-                "root": str(root),
-                "nasdaqlisted_files": len(nasdaqlisted_files),
-                "otherlisted_files": len(otherlisted_files),
-                "total_rows": total_rows,
-                "rows_by_kind": by_kind,
-                "rows_by_snapshot": snapshots,
+                "artifact_count": len(artifact_paths),
+                "row_count": row_count,
             }
         )
     finally:
         conn.close()
-
-    LOGGER.info("load-nasdaq-symbol-directory-raw-from-downloader finished")
+        LOGGER.info("load-nasdaq-symbol-directory-raw-from-downloader finished")
 
 
 if __name__ == "__main__":

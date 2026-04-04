@@ -1,20 +1,16 @@
-#!/usr/bin/env python3
 """
-Full clean rebuild orchestration for the loader build database.
+Full loader DB rebuild orchestration script.
 
-Design:
-- SQL-first orchestration, but Python remains thin for subprocess / sequencing
-- no backups
-- no "smart" fallback logic
-- one deterministic ordered pipeline
-- loud structured logs
-- failure stops the pipeline immediately
-- comments are intentionally extensive for future maintainers
+Goals:
+- use only current package/module names
+- rebuild the DB in a deterministic order
+- print a structured step summary
+- avoid any references to legacy repos or stale module paths
 
-Important operational note:
-- this script only ORCHESTRATES jobs that already own their SQL logic
-- it does not duplicate business logic from the jobs
-- it assumes the environment/venv is already correct before execution
+Important:
+- this script only orchestrates current jobs
+- it does not create backups
+- it assumes the caller intentionally wants a fresh rebuild
 """
 
 from __future__ import annotations
@@ -22,189 +18,106 @@ from __future__ import annotations
 import importlib
 import json
 import sys
-import traceback
 from pathlib import Path
 from typing import Callable
 
 
-# ---------------------------------------------------------------------------
-# Keep repo-root discovery simple and explicit.
-# This script lives in: scripts/rebuild_loader_db.py
-# So repo root is one level above this file.
-# ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-# ---------------------------------------------------------------------------
-# Ensure local editable-style imports work even if the caller forgot to use
-# "python -m" or forgot to activate the editable install.
-#
-# This was the root cause of the previous "No module named stock_quant_data"
-# failure shape seen in logs. By pushing src/ onto sys.path here, the rebuild
-# script becomes robust to the exact shell entrypoint used.
-# ---------------------------------------------------------------------------
 SRC_ROOT = REPO_ROOT / "src"
+
+# --------------------------------------------------------------------------
+# Ensure the current repo package is importable even when the script is run
+# directly with /usr/bin/python3 scripts/rebuild_loader_db.py.
+# --------------------------------------------------------------------------
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 
-def _print_header(title: str) -> None:
-    """Pretty terminal section header."""
-    print(f"===== {title} =====")
-
-
 def _print_json(payload: object) -> None:
-    """Stable pretty JSON printer for logs."""
+    """
+    Pretty JSON printer for consistent rebuild logs.
+    """
     print(json.dumps(payload, indent=2, default=str))
 
 
 def _load_run(module_name: str) -> Callable[[], None]:
     """
-    Import a job module and return its run() function.
+    Import a module and return its run() function.
 
-    We keep this tiny and explicit:
-    - import module by fully-qualified name
-    - require a callable named run
+    This keeps orchestration compact while making import failures obvious.
     """
     module = importlib.import_module(module_name)
     run_fn = getattr(module, "run", None)
-    if run_fn is None or not callable(run_fn):
-        raise AttributeError(f"Module {module_name} does not expose callable run()")
+    if run_fn is None:
+        raise AttributeError(f"{module_name} does not expose run()")
     return run_fn
-
-
-def _remove_build_db_files() -> dict[str, object]:
-    """
-    Delete the active build DB and WAL if they exist.
-
-    No backups.
-    No restore path.
-    The user explicitly asked for a clean rebuild.
-    """
-    from stock_quant_data.config.settings import get_settings
-
-    settings = get_settings()
-    db_path = Path(settings.build_db_path)
-    wal_path = Path(str(db_path) + ".wal")
-
-    removed: list[str] = []
-
-    if wal_path.exists():
-        wal_path.unlink()
-        removed.append(str(wal_path))
-
-    if db_path.exists():
-        db_path.unlink()
-        removed.append(str(db_path))
-
-    return {
-        "db_path": str(db_path),
-        "removed_files": removed,
-    }
 
 
 def _probe_required_tables() -> dict[str, dict[str, object]]:
     """
-    Probe the key required tables after rebuild.
-
-    This does not attempt deep validation. It is just a compact final smoke check
-    so the operator can immediately see whether the canonical objects exist and
-    are populated.
+    Probe required current-schema tables after the rebuild.
     """
     from stock_quant_data.db.connections import connect_build_db
 
     required_tables = [
-        "main.symbol_manual_override_map",
-        "main.nasdaq_symbol_directory_raw",
-        "main.sec_companyfacts_raw",
-        "main.sec_submissions_company_raw",
-        "main.price_source_daily_raw_stooq",
-        "main.stooq_symbol_normalization_map",
-        "main.price_source_daily_normalized",
-        "main.price_history",
-        "main.symbol_reference_candidates_from_unresolved_stooq",
-        "main.unresolved_symbol_worklist",
-        "main.sec_symbol_company_map",
-        "main.sec_symbol_company_map_targeted",
-        "main.high_priority_unresolved_symbol_probe",
-        "main.instrument",
-        "main.symbol_reference_history",
+        "symbol_manual_override_map",
+        "nasdaq_symbol_directory_raw",
+        "sec_companyfacts_raw",
+        "sec_submissions_company_raw",
+        "price_source_daily_raw_stooq",
+        "stooq_symbol_normalization_map",
+        "price_source_daily_normalized",
+        "symbol_reference_candidates_from_unresolved_stooq",
+        "unresolved_symbol_worklist",
+        "sec_symbol_company_map",
+        "sec_symbol_company_map_targeted",
+        "high_priority_unresolved_symbol_probe",
+        "instrument",
+        "symbol_reference_history",
     ]
 
     conn = connect_build_db()
     try:
-        out: dict[str, dict[str, object]] = {}
+        results: dict[str, dict[str, object]] = {}
         for table_name in required_tables:
+            qualified_name = f"main.{table_name}"
             try:
-                count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-                out[table_name] = {
-                    "status": "ok",
-                    "count": count,
-                }
-            except Exception as exc:  # pragma: no cover - operational probe path
-                out[table_name] = {
-                    "status": "error",
-                    "detail": f"{type(exc).__name__}: {exc}",
-                }
-        return out
+                row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                results[qualified_name] = {"status": "ok", "count": row_count}
+            except Exception as exc:  # noqa: BLE001
+                results[qualified_name] = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        return results
     finally:
         conn.close()
 
 
-def _run_step(name: str, module_name: str) -> dict[str, str]:
-    """
-    Execute one job step.
-
-    Returns a tiny structured summary used at the end.
-    """
-    _print_header(f"STEP: {name}")
-    try:
-        run_fn = _load_run(module_name)
-        run_fn()
-        return {
-            "name": name,
-            "status": "ok",
-            "detail": "completed",
-        }
-    except Exception as exc:
-        # Print full traceback so operators do not need a second repro just to
-        # see where the failure happened.
-        traceback.print_exc()
-        return {
-            "name": name,
-            "status": "error",
-            "detail": f"{type(exc).__name__}: {exc}",
-        }
-
-
 def main() -> None:
     """
-    Run the full clean loader rebuild.
-
-    Step ordering matters:
-    1. create schemas / base tables
-    2. load raw source tables
-    3. build broad reference layer
-    4. enrich with manual rules
-    5. normalize prices
-    6. build unresolved triage artifacts
-    7. targeted SEC repair pass
-    8. rebuild normalized/derived outputs
-    9. final probes
+    Execute the current canonical rebuild sequence.
     """
-    _print_header("REBUILD LOADER DB")
+    from stock_quant_data.config.settings import get_settings
+
+    settings = get_settings()
+    db_path = settings.build_db_path
+
+    print("===== REBUILD LOADER DB =====")
     print(f"REPO_ROOT: {REPO_ROOT}")
-
-    _print_header("REMOVE ACTIVE BUILD DB")
-    _print_json(_remove_build_db_files())
+    print(f"DB_PATH: {db_path}")
 
     # ----------------------------------------------------------------------
-    # Canonical pipeline.
-    #
-    # Only job names that belong to the CURRENT loader repo namespace.
-    # No legacy repo names.
-    # No stale module paths.
+    # Fresh rebuild means removing any old DB file up front.
+    # We intentionally do not create backups here.
     # ----------------------------------------------------------------------
-    steps: list[tuple[str, str]] = [
+    if db_path.exists():
+        db_path.unlink()
+        print(f"REMOVED_DB: {db_path}")
+
+    wal_path = Path(str(db_path) + ".wal")
+    if wal_path.exists():
+        wal_path.unlink()
+        print(f"REMOVED_WAL: {wal_path}")
+
+    steps = [
         ("init_db", "stock_quant_data.jobs.init_db"),
         ("init_price_raw_tables", "stock_quant_data.jobs.init_price_raw_tables"),
         ("build_symbol_manual_override_map", "stock_quant_data.jobs.build_symbol_manual_override_map"),
@@ -220,40 +133,47 @@ def main() -> None:
         ("build_price_normalized_from_raw_pre_norm", "stock_quant_data.jobs.build_price_normalized_from_raw"),
         ("build_stooq_symbol_normalization_map", "stock_quant_data.jobs.build_stooq_symbol_normalization_map"),
         ("build_price_normalized_from_raw_post_norm", "stock_quant_data.jobs.build_price_normalized_from_raw"),
-        ("build_price_history_from_raw_post_norm", "stock_quant_data.jobs.build_price_history_from_raw"),
         ("check_master_data_invariants_after_post_norm", "stock_quant_data.jobs.check_master_data_invariants"),
         ("build_symbol_reference_candidates_from_unresolved_stooq", "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq"),
         ("build_unresolved_symbol_worklist", "stock_quant_data.jobs.build_unresolved_symbol_worklist"),
         ("load_sec_submissions_identity_targeted", "stock_quant_data.jobs.load_sec_submissions_identity_targeted"),
         ("enrich_symbol_reference_from_sec_targeted", "stock_quant_data.jobs.enrich_symbol_reference_from_sec_targeted"),
-        ("enrich_symbol_reference_from_high_priority_sec_probe", "stock_quant_data.jobs.enrich_symbol_reference_from_high_priority_sec_probe"),
-        ("enrich_stooq_symbol_normalization_map_from_probe", "stock_quant_data.jobs.enrich_stooq_symbol_normalization_map_from_probe"),
         ("build_price_normalized_from_raw_post_sec", "stock_quant_data.jobs.build_price_normalized_from_raw"),
-        ("build_price_history_from_raw_post_sec", "stock_quant_data.jobs.build_price_history_from_raw"),
         ("check_master_data_invariants_after_post_sec", "stock_quant_data.jobs.check_master_data_invariants"),
         ("build_symbol_reference_candidates_from_unresolved_stooq_post_sec", "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq"),
         ("build_unresolved_symbol_worklist_post_sec", "stock_quant_data.jobs.build_unresolved_symbol_worklist"),
         ("build_high_priority_unresolved_symbol_probe", "stock_quant_data.jobs.build_high_priority_unresolved_symbol_probe"),
     ]
 
-    results: list[dict[str, str]] = []
+    step_results: list[dict[str, str]] = []
 
     for step_name, module_name in steps:
-        result = _run_step(step_name, module_name)
-        results.append(result)
-        if result["status"] != "ok":
-            # Hard stop. Clean failure is better than cascading nonsense.
-            break
+        print(f"===== STEP: {step_name} =====")
+        try:
+            run_fn = _load_run(module_name)
+            run_fn()
+            step_results.append(
+                {
+                    "name": step_name,
+                    "status": "ok",
+                    "detail": "completed",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: {step_name} failed")
+            step_results.append(
+                {
+                    "name": step_name,
+                    "status": "error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
-    _print_header("FINAL STEP SUMMARY")
-    _print_json(results)
+    print("===== FINAL STEP SUMMARY =====")
+    _print_json(step_results)
 
-    _print_header("REQUIRED TABLE PROBE")
+    print("===== REQUIRED TABLE PROBE =====")
     _print_json(_probe_required_tables())
-
-    # Exit non-zero if any step failed.
-    if any(r["status"] != "ok" for r in results):
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":

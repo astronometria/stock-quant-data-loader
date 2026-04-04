@@ -1,17 +1,16 @@
 """
-Build a large current-snapshot instrument + symbol reference layer
+Build a current-snapshot instrument + symbol reference layer
 from the latest Nasdaq Trader raw snapshot.
 
 Design:
 - SQL-first
-- use only the latest complete Nasdaq Trader snapshot
-- create missing instruments for symbols not already present
-- rebuild symbol_reference_history as a large current open-ended layer
-- preserve existing FB/META rename demo rows explicitly
+- use only the latest complete snapshot
+- deduplicate per symbol inside the snapshot
+- never inject old demo rows into the production identity layer
 
-Important limitation of this v1:
-- this is a current snapshot identity layer, not a full PIT historical
-  symbol identity reconstruction yet
+Important production rule:
+- this job must only materialize symbols really observed in Nasdaq raw data
+- old FB/META demo rows from legacy experimentation are intentionally removed
 """
 
 from __future__ import annotations
@@ -25,15 +24,23 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run() -> None:
+    """
+    Build the latest current identity layer from Nasdaq raw data.
+
+    Notes:
+    - This job is still a current-snapshot builder, not the final PIT identity
+      history builder.
+    - It stays conservative and deterministic.
+    """
     configure_logging()
     LOGGER.info("build-symbol-reference-from-nasdaq-latest started")
 
     conn = connect_build_db()
     try:
-        # --------------------------------------------------------------
-        # Find the latest complete snapshot id seen in raw Nasdaq data.
-        # --------------------------------------------------------------
-        latest_snapshot_id = conn.execute(
+        # ------------------------------------------------------------------
+        # Find the latest complete snapshot.
+        # ------------------------------------------------------------------
+        latest_snapshot_id_row = conn.execute(
             """
             WITH snapshot_counts AS (
                 SELECT
@@ -50,18 +57,45 @@ def run() -> None:
             """
         ).fetchone()
 
-        if latest_snapshot_id is None:
+        if latest_snapshot_id_row is None:
             raise RuntimeError("No complete Nasdaq Trader snapshot found in nasdaq_symbol_directory_raw")
 
-        latest_snapshot_id = latest_snapshot_id[0]
+        latest_snapshot_id = latest_snapshot_id_row[0]
 
-        # --------------------------------------------------------------
-        # Build a temp current snapshot view with normalized fields.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Build exactly one normalized row per symbol from the latest snapshot.
+        #
+        # The raw feed can contain multiple source kinds for the same symbol.
+        # We collapse that here so downstream inserts stay one-row-per-symbol.
+        # ------------------------------------------------------------------
         conn.execute("DROP TABLE IF EXISTS tmp_nasdaq_latest_symbol_universe")
         conn.execute(
-            f"""
+            """
             CREATE TEMP TABLE tmp_nasdaq_latest_symbol_universe AS
+            WITH raw_latest AS (
+                SELECT
+                    symbol,
+                    security_name,
+                    exchange_code,
+                    etf_flag,
+                    source_kind,
+                    snapshot_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY
+                            CASE source_kind
+                                WHEN 'nasdaqlisted' THEN 1
+                                WHEN 'otherlisted' THEN 2
+                                ELSE 99
+                            END,
+                            security_name
+                    ) AS rn
+                FROM nasdaq_symbol_directory_raw
+                WHERE snapshot_id = ?
+                  AND symbol IS NOT NULL
+                  AND symbol <> ''
+                  AND test_issue_flag = 'N'
+            )
             SELECT
                 symbol,
                 security_name,
@@ -77,21 +111,15 @@ def run() -> None:
                     WHEN upper(security_name) LIKE '%PREFERRED%' THEN 'PREFERRED_STOCK'
                     ELSE 'COMMON_STOCK'
                 END AS security_type
-            FROM nasdaq_symbol_directory_raw
-            WHERE snapshot_id = ?
-              AND symbol IS NOT NULL
-              AND symbol <> ''
-              AND test_issue_flag = 'N'
+            FROM raw_latest
+            WHERE rn = 1
             """,
             [latest_snapshot_id],
         )
 
-        # --------------------------------------------------------------
-        # Insert missing instruments.
-        #
-        # Existing instruments are reused when primary_ticker already matches.
-        # Missing ones get synthetic IDs and company_ids.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Insert missing instruments only.
+        # ------------------------------------------------------------------
         conn.execute(
             """
             INSERT INTO instrument (
@@ -134,15 +162,10 @@ def run() -> None:
             """
         )
 
-        # --------------------------------------------------------------
-        # Rebuild symbol_reference_history from scratch as a large current
-        # open-ended layer, then re-add the explicit FB/META demo rows.
-        #
-        # For price normalization today, this is enough to massively improve
-        # symbol resolution.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Rebuild the current open-ended symbol layer from scratch.
+        # ------------------------------------------------------------------
         conn.execute("DELETE FROM symbol_reference_history")
-
         conn.execute(
             """
             INSERT INTO symbol_reference_history (
@@ -184,30 +207,25 @@ def run() -> None:
             """
         )
 
-        # Preserve explicit FB/META rename example rows.
-        conn.execute(
-            """
-            INSERT INTO symbol_reference_history (
-                symbol_reference_history_id,
-                instrument_id,
-                symbol,
-                exchange,
-                is_primary,
-                effective_from,
-                effective_to
-            )
-            VALUES
-                (3005, 1005, 'FB',   'NASDAQ', TRUE, DATE '2012-05-18', DATE '2022-06-08'),
-                (3006, 1005, 'META', 'NASDAQ', TRUE, DATE '2022-06-09', NULL)
-            """
-        )
-
         instrument_count = conn.execute(
             "SELECT COUNT(*) FROM instrument"
         ).fetchone()[0]
 
         symbol_reference_count = conn.execute(
             "SELECT COUNT(*) FROM symbol_reference_history"
+        ).fetchone()[0]
+
+        duplicate_open_ended_symbol_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT symbol
+                FROM symbol_reference_history
+                WHERE effective_to IS NULL
+                GROUP BY symbol
+                HAVING COUNT(*) > 1
+            )
+            """
         ).fetchone()[0]
 
         by_security_type = conn.execute(
@@ -226,6 +244,7 @@ def run() -> None:
                 "latest_snapshot_id": latest_snapshot_id,
                 "instrument_count": instrument_count,
                 "symbol_reference_history_count": symbol_reference_count,
+                "duplicate_open_ended_symbol_count": duplicate_open_ended_symbol_count,
                 "instrument_rows_by_security_type": by_security_type,
             }
         )

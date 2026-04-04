@@ -3,7 +3,7 @@ Stage SEC companyfacts JSON files from downloader ZIP archives onto local disk.
 
 Why this job exists:
 - The downloader repo stores SEC companyfacts as ZIP archives.
-- We want the platform repo to work SQL-first from staged JSON files.
+- The loader repo should work SQL-first from staged JSON files.
 - This job keeps Python very thin: it only performs archive discovery and extraction.
 
 Design:
@@ -32,12 +32,14 @@ from stock_quant_data.config.logging import configure_logging
 
 LOGGER = logging.getLogger(__name__)
 
+# Downloader handoff boundary.
 DOWNLOADER_COMPANYFACTS_ROOT = Path(
     "/home/marty/stock-quant-data-downloader/data/sec/companyfacts"
 )
 
+# Loader-local staging root.
 STAGING_ROOT = Path(
-    "/home/marty/stock-quant-data-platform/data/staging/sec/companyfacts"
+    "/home/marty/stock-quant-data-loader/data/staging/sec/companyfacts"
 )
 
 
@@ -90,7 +92,7 @@ def run() -> None:
         snapshot_id = snapshot_id_from_zip_path(zip_path)
         snapshot_stage_dir = STAGING_ROOT / snapshot_id
 
-        # Rebuild the staged snapshot directory each run for deterministic behavior.
+        # Deterministic rerun behavior.
         if snapshot_stage_dir.exists():
             shutil.rmtree(snapshot_stage_dir)
         snapshot_stage_dir.mkdir(parents=True, exist_ok=True)

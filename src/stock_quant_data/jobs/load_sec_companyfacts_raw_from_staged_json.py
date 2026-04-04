@@ -31,13 +31,10 @@ from stock_quant_data.db.connections import connect_build_db
 
 LOGGER = logging.getLogger(__name__)
 
-STAGING_GLOB = (
-    "/home/marty/stock-quant-data-platform/data/staging/sec/companyfacts/*/*.json"
-)
-
 STAGING_ROOT = Path(
-    "/home/marty/stock-quant-data-platform/data/staging/sec/companyfacts"
+    "/home/marty/stock-quant-data-loader/data/staging/sec/companyfacts"
 )
+STAGING_GLOB = str(STAGING_ROOT / "*" / "*.json")
 
 DUCKDB_THREADS = 8
 
@@ -59,8 +56,6 @@ def run() -> None:
         conn.execute(f"PRAGMA threads={DUCKDB_THREADS}")
         conn.execute("DROP TABLE IF EXISTS sec_companyfacts_raw")
 
-        # We use read_json_auto() directly in SQL so the ingestion logic stays SQL-first.
-        # filename=true adds source path lineage per row.
         conn.execute(
             f"""
             CREATE TABLE sec_companyfacts_raw AS
@@ -117,6 +112,7 @@ def run() -> None:
             {
                 "status": "ok",
                 "job": "load-sec-companyfacts-raw-from-staged-json",
+                "staging_root": str(STAGING_ROOT),
                 "staging_glob": STAGING_GLOB,
                 "row_count": row_count,
                 "distinct_cik_count": distinct_cik_count,

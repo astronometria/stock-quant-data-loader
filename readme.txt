@@ -1,4 +1,4 @@
-stock-quant-data-platform
+stock-quant-data-loader
 Aide-memoire de l'etat actuel du projet
 Derniere mise a jour: 2026-03-29
 
@@ -441,7 +441,7 @@ Ordre recommande pour continuer:
 
 Si un nouveau chat doit reprendre ce projet, lui donner ce resume:
 
-"Je travaille sur un repo nomme stock-quant-data-platform.
+"Je travaille sur un repo nomme stock-quant-data-loader.
 Ce repo couvre uniquement la partie data platform, pas la recherche.
 L'architecture est Option B:
 - build DB mutable dans data/build/market_build.duckdb

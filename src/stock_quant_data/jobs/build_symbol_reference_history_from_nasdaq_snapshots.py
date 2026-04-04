@@ -1,16 +1,16 @@
 """
 Build a broader symbol reference history from all loaded Nasdaq Trader snapshots.
 
-SQL-first approach:
-- derive snapshot_date from snapshot_id
-- aggregate all snapshots by symbol
-- rebuild symbol_reference_history with simple intervals:
-    effective_from = first snapshot date seen
-    effective_to   = NULL if symbol is present in latest snapshot
-                     else max snapshot date seen
-- preserve explicit FB/META demo rows afterwards
+Design:
+- SQL-first
+- rebuild instrument and symbol_reference_history from Nasdaq snapshots only
+- no legacy demo row injection
+- keep one instrument row per symbol
+- keep one open-ended symbol row per symbol in the final state
 
-This is intentionally a first historical version, not the final PIT-perfect identity model.
+Important production rule:
+- this builder must reflect observed Nasdaq snapshot history only
+- old FB/META demo rows are intentionally excluded
 """
 
 from __future__ import annotations
@@ -24,6 +24,14 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run() -> None:
+    """
+    Build a broad first historical symbol layer from all loaded Nasdaq snapshots.
+
+    This remains a simplified historical builder:
+    - effective_from = first snapshot date seen
+    - effective_to   = NULL when still seen in latest snapshot
+                     = last_seen_date otherwise
+    """
     configure_logging()
     LOGGER.info("build-symbol-reference-history-from-nasdaq-snapshots started")
 
@@ -86,7 +94,15 @@ def run() -> None:
                     b.source_kind,
                     ROW_NUMBER() OVER (
                         PARTITION BY b.symbol
-                        ORDER BY b.snapshot_date DESC, b.snapshot_id DESC
+                        ORDER BY
+                            b.snapshot_date DESC,
+                            b.snapshot_id DESC,
+                            CASE b.source_kind
+                                WHEN 'nasdaqlisted' THEN 1
+                                WHEN 'otherlisted' THEN 2
+                                ELSE 99
+                            END,
+                            b.security_name
                     ) AS rn
                 FROM base AS b
             )
@@ -124,9 +140,10 @@ def run() -> None:
             [latest_snapshot_id],
         )
 
-        # Rebuild instrument from this broader history staging.
+        # ------------------------------------------------------------------
+        # Rebuild instrument from scratch from the staged history layer.
+        # ------------------------------------------------------------------
         conn.execute("DELETE FROM instrument")
-
         conn.execute(
             """
             INSERT INTO instrument (
@@ -146,9 +163,10 @@ def run() -> None:
             """
         )
 
-        # Rebuild symbol_reference_history from all snapshot history.
+        # ------------------------------------------------------------------
+        # Rebuild symbol_reference_history from scratch.
+        # ------------------------------------------------------------------
         conn.execute("DELETE FROM symbol_reference_history")
-
         conn.execute(
             """
             INSERT INTO symbol_reference_history (
@@ -177,24 +195,6 @@ def run() -> None:
             """
         )
 
-        # Preserve explicit FB/META rename demo rows.
-        conn.execute(
-            """
-            INSERT INTO symbol_reference_history (
-                symbol_reference_history_id,
-                instrument_id,
-                symbol,
-                exchange,
-                is_primary,
-                effective_from,
-                effective_to
-            )
-            VALUES
-                (3005, 1005, 'FB',   'NASDAQ', TRUE, DATE '2012-05-18', DATE '2022-06-08'),
-                (3006, 1005, 'META', 'NASDAQ', TRUE, DATE '2022-06-09', NULL)
-            """
-        )
-
         instrument_count = conn.execute(
             "SELECT COUNT(*) FROM instrument"
         ).fetchone()[0]
@@ -211,6 +211,19 @@ def run() -> None:
             """
         ).fetchone()[0]
 
+        duplicate_open_ended_symbol_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT symbol
+                FROM symbol_reference_history
+                WHERE effective_to IS NULL
+                GROUP BY symbol
+                HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()[0]
+
         print(
             {
                 "status": "ok",
@@ -219,6 +232,7 @@ def run() -> None:
                 "instrument_count": instrument_count,
                 "symbol_reference_history_count": symbol_reference_count,
                 "closed_interval_count": closed_count,
+                "duplicate_open_ended_symbol_count": duplicate_open_ended_symbol_count,
             }
         )
     finally:

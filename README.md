@@ -1,4 +1,4 @@
-# stock-quant-data-platform
+# stock-quant-data-loader
 
 Plateforme de données de marché orientée **scientifique / PIT / survivor-bias aware**.
 

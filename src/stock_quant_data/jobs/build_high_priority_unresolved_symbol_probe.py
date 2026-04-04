@@ -11,13 +11,20 @@ What this job does:
 - keeps only HIGH_PRIORITY candidates
 - enriches them with nearby matches already present in symbol_reference_history
 - enriches them with current/raw Nasdaq symbol directory presence
-- enriches them with targeted SEC identity presence
+- enriches them with targeted SEC identity presence when available
 - produces one SQL-first review table
 
 Important:
 - this is a probe / analyst-review table
 - it does NOT mutate the main reference tables
 - it does NOT create new instruments
+
+Migration compatibility:
+- during the repo split, the targeted SEC branch may not yet be available
+- specifically, sec_symbol_company_map_targeted may be absent because
+  unresolved_symbol_worklist is not migrated yet
+- in that case, this probe should still build successfully, simply without
+  the targeted SEC enrichment signal
 """
 
 from __future__ import annotations
@@ -28,6 +35,33 @@ from stock_quant_data.config.logging import configure_logging
 from stock_quant_data.db.connections import connect_build_db
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _table_exists(conn, table_name: str) -> bool:
+    """
+    Small helper used only for orchestration compatibility.
+
+    We keep Python thin:
+    - SQL still does the heavy analytical work
+    - Python only checks whether an optional upstream table exists
+    """
+    if "." in table_name:
+        schema_name, bare_table_name = table_name.split(".", 1)
+    else:
+        schema_name = "main"
+        bare_table_name = table_name
+
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM information_schema.tables
+        WHERE table_schema = ?
+          AND table_name = ?
+        """,
+        [schema_name, bare_table_name],
+    ).fetchone()
+
+    return bool(row and row[0] > 0)
 
 
 def run() -> None:
@@ -47,6 +81,51 @@ def run() -> None:
 
     conn = connect_build_db()
     try:
+        # ------------------------------------------------------------------
+        # Compatibility branch:
+        # use targeted SEC map when present, otherwise create an empty temp
+        # table with the same schema shape so the probe remains runnable.
+        #
+        # This avoids hard-failing the full rebuild while the unresolved
+        # worklist migration is still incomplete.
+        # ------------------------------------------------------------------
+        conn.execute("DROP TABLE IF EXISTS tmp_sec_symbol_company_map_targeted_probe_source")
+
+        has_targeted_sec_table = _table_exists(conn, "main.sec_symbol_company_map_targeted")
+
+        if has_targeted_sec_table:
+            conn.execute(
+                """
+                CREATE TEMP TABLE tmp_sec_symbol_company_map_targeted_probe_source AS
+                SELECT
+                    raw_id,
+                    cik,
+                    symbol,
+                    company_name,
+                    exchange,
+                    source_zip_path,
+                    json_member_name,
+                    loaded_at
+                FROM main.sec_symbol_company_map_targeted
+                """
+            )
+        else:
+            conn.execute(
+                """
+                CREATE TEMP TABLE tmp_sec_symbol_company_map_targeted_probe_source AS
+                SELECT
+                    CAST(NULL AS BIGINT) AS raw_id,
+                    CAST(NULL AS VARCHAR) AS cik,
+                    CAST(NULL AS VARCHAR) AS symbol,
+                    CAST(NULL AS VARCHAR) AS company_name,
+                    CAST(NULL AS VARCHAR) AS exchange,
+                    CAST(NULL AS VARCHAR) AS source_zip_path,
+                    CAST(NULL AS VARCHAR) AS json_member_name,
+                    CAST(NULL AS TIMESTAMP) AS loaded_at
+                WHERE FALSE
+                """
+            )
+
         conn.execute("DROP TABLE IF EXISTS high_priority_unresolved_symbol_probe")
 
         conn.execute(
@@ -215,7 +294,7 @@ def run() -> None:
                         )
                     ) FILTER (WHERE ss.symbol IS NOT NULL) AS sec_exact_matches
                 FROM priority_candidates AS pc
-                LEFT JOIN sec_symbol_company_map_targeted AS ss
+                LEFT JOIN tmp_sec_symbol_company_map_targeted_probe_source AS ss
                   ON ss.symbol = pc.raw_symbol
                 GROUP BY pc.raw_symbol
             )
@@ -291,6 +370,7 @@ def run() -> None:
                 "job": "build-high-priority-unresolved-symbol-probe",
                 "probe_row_count": row_count,
                 "rows_by_recommendation": by_recommendation,
+                "used_targeted_sec_table": has_targeted_sec_table,
             }
         )
     finally:

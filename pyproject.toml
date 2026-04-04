@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stock-quant-data-platform"
+name = "stock-quant-data-loader"
 version = "0.1.0"
-description = "Scientific PIT market data platform with immutable serving releases."
+description = "SQL-first market data loader and normalization build pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

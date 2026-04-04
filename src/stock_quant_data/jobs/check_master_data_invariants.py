@@ -1,8 +1,8 @@
 """
-Check invariant violations in the current loader DB.
+Canonical invariant checks for the current loader database.
 
-This file intentionally returns a small, stable summary payload so rebuild
-scripts can depend on it.
+This module is intentionally strict and only refers to the
+current canonical table names used by the active codebase.
 """
 
 from __future__ import annotations
@@ -17,7 +17,12 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Check canonical current invariants.
+    Run key integrity checks over the canonical master-data layer.
+
+    Current checks:
+    - no duplicate open-ended symbol_reference_history rows per symbol
+    - no duplicate instrument rows per primary_ticker
+    - no duplicate normalized rows per (source_name, source_row_id)
     """
     configure_logging()
     LOGGER.info("check-master-data-invariants started")
@@ -28,7 +33,8 @@ def run() -> None:
             """
             SELECT COUNT(*)
             FROM (
-                SELECT symbol
+                SELECT
+                    symbol
                 FROM symbol_reference_history
                 WHERE effective_to IS NULL
                 GROUP BY symbol
@@ -41,7 +47,8 @@ def run() -> None:
             """
             SELECT COUNT(*)
             FROM (
-                SELECT primary_ticker
+                SELECT
+                    primary_ticker
                 FROM instrument
                 GROUP BY primary_ticker
                 HAVING COUNT(*) > 1
@@ -53,7 +60,9 @@ def run() -> None:
             """
             SELECT COUNT(*)
             FROM (
-                SELECT source_name, source_row_id
+                SELECT
+                    source_name,
+                    source_row_id
                 FROM price_source_daily_normalized
                 GROUP BY source_name, source_row_id
                 HAVING COUNT(*) > 1

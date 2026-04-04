@@ -1,10 +1,8 @@
 """
-Enrich symbol reference state from targeted SEC symbol/company matches.
+Enrich symbol_reference_history from the targeted SEC symbol table.
 
-Intent:
-- convert targeted SEC symbol evidence into canonical instruments/open refs
-- repair existing open refs by extending effective_from backward when needed
-- do not create duplicates
+This is a targeted identity-enrichment step fed by the unresolved worklist.
+It uses the canonical targeted SEC table names only.
 """
 
 from __future__ import annotations
@@ -19,31 +17,39 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Apply targeted SEC symbol mappings into canonical master-data tables.
+    Add missing open symbol references using sec_symbol_company_map_targeted.
+
+    Rules:
+    - only create rows for symbols currently missing from open refs
+    - reuse existing instrument rows if primary_ticker already exists
+    - create missing instrument rows when required
+    - keep the current canonical schema only
     """
     configure_logging()
     LOGGER.info("enrich-symbol-reference-from-sec-targeted started")
 
     conn = connect_build_db()
     try:
-        conn.execute("DROP TABLE IF EXISTS tmp_targeted_sec_symbols")
+        conn.execute("DROP TABLE IF EXISTS tmp_sec_targeted_missing")
         conn.execute(
             """
-            CREATE TEMP TABLE tmp_targeted_sec_symbols AS
+            CREATE TEMP TABLE tmp_sec_targeted_missing AS
             SELECT DISTINCT
-                upper(trim(symbol)) AS symbol,
-                cik,
-                company_name,
-                exchange
-            FROM sec_symbol_company_map_targeted
-            WHERE symbol IS NOT NULL
-              AND trim(symbol) <> ''
+                sec.symbol,
+                COALESCE(NULLIF(sec.exchange, ''), 'UNKNOWN') AS exchange_name,
+                MIN(w.min_price_date) AS effective_from
+            FROM sec_symbol_company_map_targeted sec
+            JOIN unresolved_symbol_worklist w
+              ON w.raw_symbol = sec.symbol
+            LEFT JOIN symbol_reference_history srh
+              ON srh.symbol = sec.symbol
+             AND srh.effective_to IS NULL
+            WHERE srh.symbol IS NULL
+            GROUP BY sec.symbol, COALESCE(NULLIF(sec.exchange, ''), 'UNKNOWN')
             """
         )
 
-        # --------------------------------------------------------------
-        # Create any missing instruments for targeted SEC symbols.
-        # --------------------------------------------------------------
+        # Create missing instrument rows first.
         conn.execute(
             """
             INSERT INTO instrument (
@@ -59,57 +65,24 @@ def run() -> None:
             ),
             missing AS (
                 SELECT
-                    t.symbol,
-                    t.cik,
-                    t.exchange,
-                    ROW_NUMBER() OVER (ORDER BY t.symbol) AS rn
-                FROM tmp_targeted_sec_symbols t
+                    m.symbol,
+                    m.exchange_name,
+                    ROW_NUMBER() OVER (ORDER BY m.symbol) AS rn
+                FROM tmp_sec_targeted_missing m
                 LEFT JOIN instrument i
-                    ON i.primary_ticker = t.symbol
+                  ON i.primary_ticker = m.symbol
                 WHERE i.instrument_id IS NULL
             )
             SELECT
                 (SELECT max_id FROM current_max) + rn AS instrument_id,
                 'COMMON_STOCK' AS security_type,
-                'SEC_' || COALESCE(cik, symbol) AS company_id,
+                'SEC_TARGETED_' || symbol AS company_id,
                 symbol AS primary_ticker,
-                COALESCE(exchange, 'UNKNOWN') AS primary_exchange
+                exchange_name AS primary_exchange
             FROM missing
             """
         )
 
-        # --------------------------------------------------------------
-        # Back-extend existing open symbol refs when SEC-targeted symbols are
-        # already present as current refs but started too recently.
-        # --------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_targeted_price_min")
-        conn.execute(
-            """
-            CREATE TEMP TABLE tmp_targeted_price_min AS
-            SELECT
-                raw_symbol AS symbol,
-                MIN(price_date) AS min_price_date
-            FROM price_source_daily_raw_stooq
-            WHERE raw_symbol IN (SELECT symbol FROM tmp_targeted_sec_symbols)
-            GROUP BY raw_symbol
-            """
-        )
-
-        conn.execute(
-            """
-            UPDATE symbol_reference_history AS srh
-            SET effective_from = LEAST(srh.effective_from, tpm.min_price_date)
-            FROM tmp_targeted_price_min tpm
-            WHERE srh.symbol = tpm.symbol
-              AND srh.effective_to IS NULL
-              AND tpm.min_price_date IS NOT NULL
-            """
-        )
-
-        # --------------------------------------------------------------
-        # Insert new open refs for targeted symbols still missing after the
-        # repair step above.
-        # --------------------------------------------------------------
         conn.execute(
             """
             INSERT INTO symbol_reference_history (
@@ -128,59 +101,35 @@ def run() -> None:
             staged AS (
                 SELECT
                     i.instrument_id,
-                    t.symbol,
-                    COALESCE(t.exchange, i.primary_exchange, 'UNKNOWN') AS exchange_name,
-                    COALESCE(p.min_price_date, DATE '2026-03-30') AS effective_from,
-                    ROW_NUMBER() OVER (ORDER BY t.symbol) AS rn
-                FROM tmp_targeted_sec_symbols t
+                    m.symbol,
+                    m.exchange_name,
+                    m.effective_from,
+                    ROW_NUMBER() OVER (ORDER BY m.symbol) AS rn
+                FROM tmp_sec_targeted_missing m
                 JOIN instrument i
-                    ON i.primary_ticker = t.symbol
-                LEFT JOIN tmp_targeted_price_min p
-                    ON p.symbol = t.symbol
-                LEFT JOIN symbol_reference_history srh
-                    ON srh.symbol = t.symbol
-                   AND srh.effective_to IS NULL
-                WHERE srh.symbol IS NULL
+                  ON i.primary_ticker = m.symbol
             )
             SELECT
                 (SELECT max_id FROM current_max) + rn AS symbol_reference_history_id,
                 instrument_id,
                 symbol,
                 exchange_name,
-                TRUE AS is_primary,
+                TRUE,
                 effective_from,
-                NULL AS effective_to
+                NULL
             FROM staged
             """
         )
 
         added_symbol_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tmp_targeted_sec_symbols t
-            LEFT JOIN v_symbol_reference_history_open_intervals v
-                ON v.symbol = t.symbol
-            WHERE v.symbol IS NULL
-            """
+            "SELECT COUNT(*) FROM tmp_sec_targeted_missing"
         ).fetchone()[0]
 
-        repaired_rows = conn.execute(
-            """
-            SELECT
-                srh.symbol,
-                srh.instrument_id,
-                srh.exchange,
-                srh.effective_from,
-                srh.effective_to
-            FROM symbol_reference_history srh
-            WHERE srh.symbol IN (SELECT symbol FROM tmp_targeted_sec_symbols)
-              AND srh.effective_to IS NULL
-            ORDER BY srh.symbol
-            """
-        ).fetchall()
+        instrument_count = conn.execute(
+            "SELECT COUNT(*) FROM instrument"
+        ).fetchone()[0]
 
-        instrument_count = conn.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
-        symbol_reference_count = conn.execute(
+        symbol_reference_history_count = conn.execute(
             "SELECT COUNT(*) FROM symbol_reference_history"
         ).fetchone()[0]
 
@@ -189,10 +138,8 @@ def run() -> None:
                 "status": "ok",
                 "job": "enrich-symbol-reference-from-sec-targeted",
                 "added_symbol_count": added_symbol_count,
-                "repaired_symbol_count": len(repaired_rows),
                 "instrument_count": instrument_count,
-                "symbol_reference_history_count": symbol_reference_count,
-                "repaired_rows": repaired_rows,
+                "symbol_reference_history_count": symbol_reference_history_count,
             }
         )
     finally:

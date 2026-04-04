@@ -1,9 +1,8 @@
 """
-Create canonical raw + normalized price tables.
+Initialize raw/normalized price tables for the current loader repo.
 
-This file is intentionally tiny and explicit.
-It owns only the price tables that the current loader repo is supposed to
-create and maintain.
+This module only guarantees that the canonical tables exist.
+It must not introduce alternate or legacy table names.
 """
 
 from __future__ import annotations
@@ -18,9 +17,9 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Ensure current canonical price tables exist.
+    Ensure the canonical raw and normalized price tables exist.
 
-    Canonical tables:
+    Canonical table names:
     - price_source_daily_raw_stooq
     - price_source_daily_raw_yahoo
     - price_source_daily_normalized
@@ -40,7 +39,9 @@ def run() -> None:
                 high DOUBLE NOT NULL,
                 low DOUBLE NOT NULL,
                 close DOUBLE NOT NULL,
-                volume BIGINT NOT NULL
+                volume BIGINT NOT NULL,
+                source_file_path VARCHAR,
+                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -56,7 +57,9 @@ def run() -> None:
                 low DOUBLE NOT NULL,
                 close DOUBLE NOT NULL,
                 adj_close DOUBLE,
-                volume BIGINT NOT NULL
+                volume BIGINT NOT NULL,
+                source_batch_id VARCHAR,
+                loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )

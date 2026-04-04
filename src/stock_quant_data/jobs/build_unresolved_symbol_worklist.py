@@ -1,8 +1,8 @@
 """
-Build the review worklist from current unresolved candidates.
+Build the unresolved symbol worklist from the candidate table.
 
-Canonical target:
-- unresolved_symbol_worklist
+Only identity-creation actions belong in this worklist.
+Formatting-only rows stay in the candidate table but are excluded here.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Rebuild the unresolved symbol worklist table.
+    Materialize the manual review worklist from candidate rows.
     """
     configure_logging()
     LOGGER.info("build-unresolved-symbol-worklist started")
@@ -60,7 +60,7 @@ def run() -> None:
             "SELECT COUNT(*) FROM unresolved_symbol_worklist"
         ).fetchone()[0]
 
-        rows_by_suggested_action = conn.execute(
+        rows_by_action = conn.execute(
             """
             SELECT suggested_action, COUNT(*)
             FROM unresolved_symbol_worklist
@@ -74,7 +74,7 @@ def run() -> None:
                 "status": "ok",
                 "job": "build-unresolved-symbol-worklist",
                 "worklist_count": worklist_count,
-                "rows_by_suggested_action": rows_by_suggested_action,
+                "rows_by_suggested_action": rows_by_action,
             }
         )
     finally:

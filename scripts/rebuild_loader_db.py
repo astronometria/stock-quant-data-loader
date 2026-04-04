@@ -28,7 +28,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from stock_quant_data.config.settings import get_settings  # noqa: E402
+from stock_quant_data.config.settings import settings  # noqa: E402
 
 
 def _print_json(payload: object) -> None:
@@ -55,8 +55,6 @@ def _remove_existing_db_files() -> None:
 
     The user explicitly asked for a clean rebuild without backup handling.
     """
-    settings = get_settings()
-
     db_path = settings.build_db_path
     wal_path = Path(str(db_path) + ".wal")
 
@@ -105,7 +103,7 @@ def _probe_required_tables() -> dict[str, dict[str, object]]:
             try:
                 count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
                 out[f"main.{table_name}"] = {"status": "ok", "count": count}
-            except Exception as exc:  # pragma: no cover - log-friendly path
+            except Exception as exc:
                 out[f"main.{table_name}"] = {
                     "status": "error",
                     "detail": f"{type(exc).__name__}: {exc}",
@@ -122,34 +120,101 @@ def main() -> None:
     Order matters because later jobs depend on tables materialized by
     earlier jobs.
     """
+    settings.ensure_directories()
     _remove_existing_db_files()
 
     steps: list[tuple[str, str]] = [
         ("init_db", "stock_quant_data.jobs.init_db"),
         ("init_price_raw_tables", "stock_quant_data.jobs.init_price_raw_tables"),
         ("build_symbol_manual_override_map", "stock_quant_data.jobs.build_symbol_manual_override_map"),
-        ("load_nasdaq_symbol_directory_raw_from_downloader", "stock_quant_data.jobs.load_nasdaq_symbol_directory_raw_from_downloader"),
-        ("stage_sec_companyfacts_json_from_downloader", "stock_quant_data.jobs.stage_sec_companyfacts_json_from_downloader"),
-        ("load_sec_companyfacts_raw_from_staged_json", "stock_quant_data.jobs.load_sec_companyfacts_raw_from_staged_json"),
-        ("load_sec_submissions_identity_from_downloader", "stock_quant_data.jobs.load_sec_submissions_identity_from_downloader"),
-        ("load_price_source_daily_raw_stooq_from_disk", "stock_quant_data.jobs.load_price_source_daily_raw_stooq_from_disk"),
-        ("build_symbol_reference_from_nasdaq_latest", "stock_quant_data.jobs.build_symbol_reference_from_nasdaq_latest"),
-        ("build_symbol_reference_history_from_nasdaq_snapshots", "stock_quant_data.jobs.build_symbol_reference_history_from_nasdaq_snapshots"),
-        ("enrich_symbol_reference_from_manual_overrides", "stock_quant_data.jobs.enrich_symbol_reference_from_manual_overrides"),
-        ("check_master_data_invariants_after_manual", "stock_quant_data.jobs.check_master_data_invariants"),
-        ("build_price_normalized_from_raw_pre_norm", "stock_quant_data.jobs.build_price_normalized_from_raw"),
-        ("build_stooq_symbol_normalization_map", "stock_quant_data.jobs.build_stooq_symbol_normalization_map"),
-        ("build_price_normalized_from_raw_post_norm", "stock_quant_data.jobs.build_price_normalized_from_raw"),
-        ("check_master_data_invariants_after_post_norm", "stock_quant_data.jobs.check_master_data_invariants"),
-        ("build_symbol_reference_candidates_from_unresolved_stooq", "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq"),
-        ("build_unresolved_symbol_worklist", "stock_quant_data.jobs.build_unresolved_symbol_worklist"),
-        ("load_sec_submissions_identity_targeted", "stock_quant_data.jobs.load_sec_submissions_identity_targeted"),
-        ("enrich_symbol_reference_from_sec_targeted", "stock_quant_data.jobs.enrich_symbol_reference_from_sec_targeted"),
-        ("build_price_normalized_from_raw_post_sec", "stock_quant_data.jobs.build_price_normalized_from_raw"),
-        ("check_master_data_invariants_after_post_sec", "stock_quant_data.jobs.check_master_data_invariants"),
-        ("build_symbol_reference_candidates_from_unresolved_stooq_post_sec", "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq"),
-        ("build_unresolved_symbol_worklist_post_sec", "stock_quant_data.jobs.build_unresolved_symbol_worklist"),
-        ("build_high_priority_unresolved_symbol_probe", "stock_quant_data.jobs.build_high_priority_unresolved_symbol_probe"),
+        (
+            "load_nasdaq_symbol_directory_raw_from_downloader",
+            "stock_quant_data.jobs.load_nasdaq_symbol_directory_raw_from_downloader",
+        ),
+        (
+            "stage_sec_companyfacts_json_from_downloader",
+            "stock_quant_data.jobs.stage_sec_companyfacts_json_from_downloader",
+        ),
+        (
+            "load_sec_companyfacts_raw_from_staged_json",
+            "stock_quant_data.jobs.load_sec_companyfacts_raw_from_staged_json",
+        ),
+        (
+            "load_sec_submissions_identity_from_downloader",
+            "stock_quant_data.jobs.load_sec_submissions_identity_from_downloader",
+        ),
+        (
+            "load_price_source_daily_raw_stooq_from_disk",
+            "stock_quant_data.jobs.load_price_source_daily_raw_stooq_from_disk",
+        ),
+        (
+            "build_symbol_reference_from_nasdaq_latest",
+            "stock_quant_data.jobs.build_symbol_reference_from_nasdaq_latest",
+        ),
+        (
+            "build_symbol_reference_history_from_nasdaq_snapshots",
+            "stock_quant_data.jobs.build_symbol_reference_history_from_nasdaq_snapshots",
+        ),
+        (
+            "enrich_symbol_reference_from_manual_overrides",
+            "stock_quant_data.jobs.enrich_symbol_reference_from_manual_overrides",
+        ),
+        (
+            "check_master_data_invariants_after_manual",
+            "stock_quant_data.jobs.check_master_data_invariants",
+        ),
+        (
+            "build_price_normalized_from_raw_pre_norm",
+            "stock_quant_data.jobs.build_price_normalized_from_raw",
+        ),
+        (
+            "build_stooq_symbol_normalization_map",
+            "stock_quant_data.jobs.build_stooq_symbol_normalization_map",
+        ),
+        (
+            "build_price_normalized_from_raw_post_norm",
+            "stock_quant_data.jobs.build_price_normalized_from_raw",
+        ),
+        (
+            "check_master_data_invariants_after_post_norm",
+            "stock_quant_data.jobs.check_master_data_invariants",
+        ),
+        (
+            "build_symbol_reference_candidates_from_unresolved_stooq",
+            "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq",
+        ),
+        (
+            "build_unresolved_symbol_worklist",
+            "stock_quant_data.jobs.build_unresolved_symbol_worklist",
+        ),
+        (
+            "load_sec_submissions_identity_targeted",
+            "stock_quant_data.jobs.load_sec_submissions_identity_targeted",
+        ),
+        (
+            "enrich_symbol_reference_from_sec_targeted",
+            "stock_quant_data.jobs.enrich_symbol_reference_from_sec_targeted",
+        ),
+        (
+            "build_price_normalized_from_raw_post_sec",
+            "stock_quant_data.jobs.build_price_normalized_from_raw",
+        ),
+        (
+            "check_master_data_invariants_after_post_sec",
+            "stock_quant_data.jobs.check_master_data_invariants",
+        ),
+        (
+            "build_symbol_reference_candidates_from_unresolved_stooq_post_sec",
+            "stock_quant_data.jobs.build_symbol_reference_candidates_from_unresolved_stooq",
+        ),
+        (
+            "build_unresolved_symbol_worklist_post_sec",
+            "stock_quant_data.jobs.build_unresolved_symbol_worklist",
+        ),
+        (
+            "build_high_priority_unresolved_symbol_probe",
+            "stock_quant_data.jobs.build_high_priority_unresolved_symbol_probe",
+        ),
     ]
 
     summary: list[dict[str, str]] = []
@@ -166,7 +231,7 @@ def main() -> None:
                     "detail": "completed",
                 }
             )
-        except Exception as exc:  # pragma: no cover - log-first path
+        except Exception as exc:
             summary.append(
                 {
                     "name": step_name,

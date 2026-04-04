@@ -1,8 +1,10 @@
 """
-Build candidate rows from unresolved normalized Stooq prices.
+Build canonical unresolved-symbol candidates from the normalized Stooq layer.
 
-This is a ranking/staging table only.
-It does not mutate instrument or symbol_reference_history.
+This job is the single source of truth for unresolved symbol triage.
+It only reads current canonical tables and writes the canonical
+candidate table:
+- symbol_reference_candidates_from_unresolved_stooq
 """
 
 from __future__ import annotations
@@ -17,30 +19,24 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Summarize unresolved symbols into a canonical candidate table.
+    Materialize unresolved symbol candidates from the normalized table.
+
+    Families and actions:
+    - WARRANT_DASH_WS      -> REVIEW_FOR_SYMBOL_FORMAT_MAPPING
+    - UNIT_DASH_U          -> REVIEW_FOR_SYMBOL_FORMAT_MAPPING
+    - UNDERSCORE_VARIANT   -> REVIEW_FOR_SYMBOL_FORMAT_MAPPING
+    - plain alnum symbols with meaningful volume -> reference identity review
+    - very small row-count leftovers -> review later
     """
     configure_logging()
     LOGGER.info("build-symbol-reference-candidates-from-unresolved-stooq started")
 
     conn = connect_build_db()
     try:
-        conn.execute("DELETE FROM symbol_reference_candidates_from_unresolved_stooq")
-
+        conn.execute("DROP TABLE IF EXISTS symbol_reference_candidates_from_unresolved_stooq")
         conn.execute(
             """
-            INSERT INTO symbol_reference_candidates_from_unresolved_stooq (
-                raw_symbol,
-                unresolved_row_count,
-                min_price_date,
-                max_price_date,
-                first_source_row_id,
-                last_source_row_id,
-                candidate_family,
-                suggested_action,
-                recency_bucket,
-                normalization_notes_example,
-                built_at
-            )
+            CREATE TABLE symbol_reference_candidates_from_unresolved_stooq AS
             WITH unresolved AS (
                 SELECT
                     raw_symbol,
@@ -65,19 +61,19 @@ def run() -> None:
                     CASE
                         WHEN raw_symbol LIKE '%-WS' THEN 'WARRANT_DASH_WS'
                         WHEN raw_symbol LIKE '%-U' THEN 'UNIT_DASH_U'
-                        WHEN raw_symbol LIKE '%\_%' ESCAPE '\' THEN 'UNDERSCORE_VARIANT'
+                        WHEN raw_symbol LIKE '%\_%' ESCAPE '\\' THEN 'UNDERSCORE_VARIANT'
                         ELSE 'PLAIN_ALNUM'
                     END AS candidate_family,
                     CASE
                         WHEN raw_symbol LIKE '%-WS' THEN 'REVIEW_FOR_SYMBOL_FORMAT_MAPPING'
                         WHEN raw_symbol LIKE '%-U' THEN 'REVIEW_FOR_SYMBOL_FORMAT_MAPPING'
-                        WHEN raw_symbol LIKE '%\_%' ESCAPE '\' THEN 'REVIEW_FOR_SYMBOL_FORMAT_MAPPING'
+                        WHEN raw_symbol LIKE '%\_%' ESCAPE '\\' THEN 'REVIEW_FOR_SYMBOL_FORMAT_MAPPING'
                         WHEN unresolved_row_count >= 1000 THEN 'REVIEW_FOR_REFERENCE_IDENTITY_CREATION_HIGH_PRIORITY'
                         WHEN unresolved_row_count >= 100 THEN 'REVIEW_FOR_REFERENCE_IDENTITY_CREATION'
                         ELSE 'REVIEW_LATER_LOW_VOLUME'
                     END AS suggested_action,
                     CASE
-                        WHEN max_price_date >= CURRENT_DATE - INTERVAL 90 DAY THEN 'RECENT'
+                        WHEN max_price_date >= CURRENT_DATE - INTERVAL 120 DAY THEN 'RECENT'
                         WHEN max_price_date >= CURRENT_DATE - INTERVAL 365 DAY THEN 'MID'
                         ELSE 'OLD'
                     END AS recency_bucket,
@@ -95,7 +91,7 @@ def run() -> None:
                 suggested_action,
                 recency_bucket,
                 normalization_notes_example,
-                CURRENT_TIMESTAMP
+                CURRENT_TIMESTAMP AS built_at
             FROM classified
             ORDER BY unresolved_row_count DESC, raw_symbol
             """
@@ -110,11 +106,11 @@ def run() -> None:
             SELECT candidate_family, COUNT(*)
             FROM symbol_reference_candidates_from_unresolved_stooq
             GROUP BY candidate_family
-            ORDER BY COUNT(*) DESC, candidate_family
+            ORDER BY candidate_family
             """
         ).fetchall()
 
-        rows_by_action = conn.execute(
+        rows_by_suggested_action = conn.execute(
             """
             SELECT suggested_action, COUNT(*)
             FROM symbol_reference_candidates_from_unresolved_stooq
@@ -129,7 +125,7 @@ def run() -> None:
                 "job": "build-symbol-reference-candidates-from-unresolved-stooq",
                 "candidate_row_count": candidate_row_count,
                 "rows_by_family": rows_by_family,
-                "rows_by_suggested_action": rows_by_action,
+                "rows_by_suggested_action": rows_by_suggested_action,
             }
         )
     finally:

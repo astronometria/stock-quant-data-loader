@@ -1,13 +1,14 @@
 """
-Build normalized prices from canonical raw tables.
+Build canonical normalized price rows from the raw price layer.
 
-Key rules:
-- use only current canonical table names
-- resolve through symbol_reference_history open intervals first
-- if a normalization map transforms a raw symbol into a canonical symbol,
-  resolve using the transformed symbol
-- preserve raw_symbol in the normalized output for auditability
-- never introduce duplicate source_row_id groups for a given source
+This job only uses:
+- price_source_daily_raw_stooq
+- price_source_daily_raw_yahoo
+- symbol_reference_history
+- stooq_symbol_normalization_map
+
+Output:
+- price_source_daily_normalized
 """
 
 from __future__ import annotations
@@ -23,15 +24,18 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Rebuild price_source_daily_normalized from raw source tables.
+    Rebuild the canonical normalized price table.
 
-    Current implementation normalizes Stooq data and keeps the schema aligned
-    with the current repo contract.
+    Matching order for Stooq rows:
+    1) exact raw_symbol -> open symbol_reference_history symbol
+    2) mapped normalized_symbol via stooq_symbol_normalization_map -> open symbol_reference_history symbol
+
+    A row is RESOLVED only when an instrument_id is found.
     """
     configure_logging()
     LOGGER.info("build-price-normalized-from-raw started")
 
-    # Keep the table creation dependency explicit and local.
+    # Keep the target table present even if this job is invoked alone.
     run_init_price_raw_tables()
 
     conn = connect_build_db()
@@ -39,50 +43,7 @@ def run() -> None:
         conn.execute("DELETE FROM price_source_daily_normalized")
 
         # --------------------------------------------------------------
-        # Stage open symbol reference intervals only once.
-        # This keeps the main insert query simpler and easier to audit.
-        # --------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_open_symbol_reference")
-        conn.execute(
-            """
-            CREATE TEMP TABLE tmp_open_symbol_reference AS
-            SELECT
-                symbol,
-                instrument_id,
-                exchange,
-                effective_from,
-                effective_to
-            FROM symbol_reference_history
-            WHERE effective_to IS NULL
-            """
-        )
-
-        # --------------------------------------------------------------
-        # Stage normalization map.
-        # A missing row means raw_symbol should be attempted as-is.
-        # --------------------------------------------------------------
-        conn.execute("DROP TABLE IF EXISTS tmp_stooq_norm_map")
-        conn.execute(
-            """
-            CREATE TEMP TABLE tmp_stooq_norm_map AS
-            SELECT
-                raw_symbol,
-                normalized_symbol,
-                rule_name
-            FROM stooq_symbol_normalization_map
-            """
-        )
-
-        # --------------------------------------------------------------
-        # Build normalized Stooq rows.
-        #
-        # Resolution order:
-        # 1) mapped symbol from normalization map
-        # 2) raw symbol as-is
-        #
-        # Open-interval resolution:
-        # - match on current open refs only
-        # - respect effective_from in case an open ref was back-extended
+        # Canonical Stooq normalization pipeline.
         # --------------------------------------------------------------
         conn.execute(
             """
@@ -103,72 +64,68 @@ def run() -> None:
                 normalization_notes,
                 normalized_at
             )
-            WITH stooq_base AS (
+            WITH open_refs AS (
                 SELECT
-                    raw_price_id AS source_row_id,
+                    symbol,
+                    instrument_id
+                FROM symbol_reference_history
+                WHERE effective_to IS NULL
+            ),
+            stooq_base AS (
+                SELECT
+                    r.raw_id AS source_row_id,
+                    r.symbol AS raw_symbol,
+                    r.price_date,
+                    r.open,
+                    r.high,
+                    r.low,
+                    r.close,
+                    r.adj_close,
+                    r.volume,
+                    exact.instrument_id AS exact_instrument_id,
+                    map.normalized_symbol,
+                    mapped.instrument_id AS mapped_instrument_id,
+                    map.rule_name
+                FROM price_source_daily_raw_stooq r
+                LEFT JOIN open_refs exact
+                  ON exact.symbol = r.symbol
+                LEFT JOIN stooq_symbol_normalization_map map
+                  ON map.raw_symbol = r.symbol
+                LEFT JOIN open_refs mapped
+                  ON mapped.symbol = map.normalized_symbol
+            ),
+            staged AS (
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY source_row_id) AS normalized_price_id,
+                    'stooq' AS source_name,
+                    source_row_id,
                     raw_symbol,
+                    COALESCE(exact_instrument_id, mapped_instrument_id) AS instrument_id,
                     price_date,
                     open,
                     high,
                     low,
                     close,
-                    CAST(NULL AS DOUBLE) AS adj_close,
-                    volume
-                FROM price_source_daily_raw_stooq
-            ),
-            staged AS (
-                SELECT
-                    b.source_row_id,
-                    b.raw_symbol,
-                    b.price_date,
-                    b.open,
-                    b.high,
-                    b.low,
-                    b.close,
-                    b.adj_close,
-                    b.volume,
-                    m.normalized_symbol,
-                    m.rule_name,
-                    COALESCE(m.normalized_symbol, b.raw_symbol) AS attempted_symbol
-                FROM stooq_base b
-                LEFT JOIN tmp_stooq_norm_map m
-                    ON m.raw_symbol = b.raw_symbol
-            ),
-            resolved AS (
-                SELECT
-                    s.source_row_id,
-                    s.raw_symbol,
-                    s.price_date,
-                    s.open,
-                    s.high,
-                    s.low,
-                    s.close,
-                    s.adj_close,
-                    s.volume,
-                    s.normalized_symbol,
-                    s.rule_name,
-                    r.instrument_id,
+                    adj_close,
+                    volume,
                     CASE
-                        WHEN r.instrument_id IS NOT NULL THEN 'RESOLVED'
+                        WHEN COALESCE(exact_instrument_id, mapped_instrument_id) IS NOT NULL
+                            THEN 'RESOLVED'
                         ELSE 'UNRESOLVED'
                     END AS symbol_resolution_status,
                     CASE
-                        WHEN r.instrument_id IS NOT NULL AND s.normalized_symbol IS NOT NULL
-                            THEN 'mapped via ' || s.rule_name || ' to ' || s.normalized_symbol
-                        WHEN r.instrument_id IS NOT NULL
-                            THEN NULL
-                        WHEN s.normalized_symbol IS NOT NULL
-                            THEN 'mapped to ' || s.normalized_symbol || ' but no matching symbol reference found'
+                        WHEN exact_instrument_id IS NOT NULL
+                            THEN 'exact raw symbol matched open symbol reference'
+                        WHEN mapped_instrument_id IS NOT NULL
+                            THEN 'mapped via ' || COALESCE(rule_name, 'stooq_symbol_normalization_map')
                         ELSE 'no matching symbol mapping found'
-                    END AS normalization_notes
-                FROM staged s
-                LEFT JOIN tmp_open_symbol_reference r
-                    ON r.symbol = s.attempted_symbol
-                   AND s.price_date >= r.effective_from
+                    END AS normalization_notes,
+                    CURRENT_TIMESTAMP AS normalized_at
+                FROM stooq_base
             )
             SELECT
-                ROW_NUMBER() OVER (ORDER BY source_row_id) AS normalized_price_id,
-                'stooq' AS source_name,
+                normalized_price_id,
+                source_name,
                 source_row_id,
                 raw_symbol,
                 instrument_id,
@@ -181,16 +138,16 @@ def run() -> None:
                 volume,
                 symbol_resolution_status,
                 normalization_notes,
-                CURRENT_TIMESTAMP AS normalized_at
-            FROM resolved
+                normalized_at
+            FROM staged
             """
         )
 
-        normalized_count = conn.execute(
+        price_source_daily_normalized_count = conn.execute(
             "SELECT COUNT(*) FROM price_source_daily_normalized"
         ).fetchone()[0]
 
-        unresolved_count = conn.execute(
+        unresolved_symbol_count = conn.execute(
             """
             SELECT COUNT(*)
             FROM price_source_daily_normalized
@@ -207,7 +164,7 @@ def run() -> None:
             """
         ).fetchall()
 
-        duplicate_source_row_groups = conn.execute(
+        duplicated_source_row_id_groups = conn.execute(
             """
             SELECT COUNT(*)
             FROM (
@@ -221,15 +178,30 @@ def run() -> None:
             """
         ).fetchone()[0]
 
+        used_normalization_map_table = conn.execute(
+            """
+            SELECT CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'main'
+                      AND table_name = 'stooq_symbol_normalization_map'
+                )
+                THEN TRUE
+                ELSE FALSE
+            END
+            """
+        ).fetchone()[0]
+
         print(
             {
                 "status": "ok",
                 "job": "build-price-normalized-from-raw",
-                "price_source_daily_normalized_count": normalized_count,
-                "unresolved_symbol_count": unresolved_count,
+                "price_source_daily_normalized_count": price_source_daily_normalized_count,
+                "unresolved_symbol_count": unresolved_symbol_count,
                 "rows_by_source": rows_by_source,
-                "duplicated_source_row_id_groups": duplicate_source_row_groups,
-                "used_normalization_map_table": True,
+                "duplicated_source_row_id_groups": duplicated_source_row_id_groups,
+                "used_normalization_map_table": used_normalization_map_table,
             }
         )
     finally:

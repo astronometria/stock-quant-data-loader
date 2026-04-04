@@ -1,8 +1,8 @@
 """
-Build the unresolved symbol worklist from the candidate table.
+Build the canonical unresolved symbol worklist.
 
-Only identity-creation actions belong in this worklist.
-Formatting-only rows stay in the candidate table but are excluded here.
+This table is intentionally derived from the canonical candidate table and
+contains only the rows that still require identity creation work.
 """
 
 from __future__ import annotations
@@ -17,27 +17,19 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Materialize the manual review worklist from candidate rows.
+    Materialize unresolved_symbol_worklist from the candidate table.
+
+    Only the identity-creation actions belong in this worklist.
     """
     configure_logging()
     LOGGER.info("build-unresolved-symbol-worklist started")
 
     conn = connect_build_db()
     try:
-        conn.execute("DELETE FROM unresolved_symbol_worklist")
-
+        conn.execute("DROP TABLE IF EXISTS unresolved_symbol_worklist")
         conn.execute(
             """
-            INSERT INTO unresolved_symbol_worklist (
-                raw_symbol,
-                unresolved_row_count,
-                min_price_date,
-                max_price_date,
-                candidate_family,
-                suggested_action,
-                recency_bucket,
-                built_at
-            )
+            CREATE TABLE unresolved_symbol_worklist AS
             SELECT
                 raw_symbol,
                 unresolved_row_count,
@@ -46,7 +38,7 @@ def run() -> None:
                 candidate_family,
                 suggested_action,
                 recency_bucket,
-                CURRENT_TIMESTAMP
+                CURRENT_TIMESTAMP AS built_at
             FROM symbol_reference_candidates_from_unresolved_stooq
             WHERE suggested_action IN (
                 'REVIEW_FOR_REFERENCE_IDENTITY_CREATION',
@@ -60,7 +52,7 @@ def run() -> None:
             "SELECT COUNT(*) FROM unresolved_symbol_worklist"
         ).fetchone()[0]
 
-        rows_by_action = conn.execute(
+        rows_by_suggested_action = conn.execute(
             """
             SELECT suggested_action, COUNT(*)
             FROM unresolved_symbol_worklist
@@ -74,7 +66,7 @@ def run() -> None:
                 "status": "ok",
                 "job": "build-unresolved-symbol-worklist",
                 "worklist_count": worklist_count,
-                "rows_by_suggested_action": rows_by_action,
+                "rows_by_suggested_action": rows_by_suggested_action,
             }
         )
     finally:

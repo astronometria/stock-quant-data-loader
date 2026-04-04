@@ -1,12 +1,11 @@
 """
-Full rebuild orchestration script for stock-quant-data-loader.
+Rebuild the loader DuckDB database from scratch using the current canonical jobs.
 
-Important design choices:
+Important constraints for this script:
 - no backup logic
-- no destructive file rename logic
-- explicit CURRENT job list only
-- import through the current package only
-- stable JSON-ish printed summaries for shell inspection
+- no legacy table names
+- no alternate repo imports
+- explicit, readable step list
 """
 
 from __future__ import annotations
@@ -15,58 +14,70 @@ import importlib
 import json
 import sys
 from pathlib import Path
-from typing import Any
-
+from typing import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 
+# --------------------------------------------------------------------
+# Make the local src/ tree importable even when the editable install is
+# not active yet. This keeps the rebuild script deterministic when it is
+# launched directly via:
+#   ./.venv/bin/python scripts/rebuild_loader_db.py
+# --------------------------------------------------------------------
 if str(SRC_DIR) not in sys.path:
-    # ------------------------------------------------------------------
-    # Critical fix:
-    # running "python scripts/rebuild_loader_db.py" from the repo root or
-    # elsewhere must still be able to import stock_quant_data from ./src.
-    # ------------------------------------------------------------------
     sys.path.insert(0, str(SRC_DIR))
 
+from stock_quant_data.config.settings import get_settings  # noqa: E402
 
-def _print_json(payload: Any) -> None:
-    """
-    Print deterministic pretty JSON for shell logs.
-    """
+
+def _print_json(payload: object) -> None:
+    """Pretty-print JSON for shell logs."""
     print(json.dumps(payload, indent=2, default=str))
 
 
-def _load_run(module_name: str):
+def _load_run(module_name: str) -> Callable[[], None]:
     """
-    Import a module and return its run() function.
+    Import a module and return its `run` entrypoint.
+
+    We keep this loader tiny and explicit so failures are easy to trace.
     """
     module = importlib.import_module(module_name)
     run_fn = getattr(module, "run", None)
     if run_fn is None:
-        raise AttributeError(f"Module {module_name} has no run()")
+        raise AttributeError(f"Module {module_name!r} does not expose run()")
     return run_fn
 
 
-def _run_step(name: str, module_name: str) -> dict[str, str]:
+def _remove_existing_db_files() -> None:
     """
-    Execute one job and capture a compact status record.
+    Remove the active build DB and WAL before the clean rebuild.
+
+    The user explicitly asked for a clean rebuild without backup handling.
     """
-    print(f"===== STEP: {name} =====")
-    try:
-        run_fn = _load_run(module_name)
-        run_fn()
-        return {"name": name, "status": "ok", "detail": "completed"}
-    except Exception as exc:  # noqa: BLE001
-        print(f"ERROR: {name} failed")
-        return {"name": name, "status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+    settings = get_settings()
+
+    db_path = settings.build_db_path
+    wal_path = Path(str(db_path) + ".wal")
+
+    print("===== REBUILD LOADER DB =====")
+    print(f"REPO_ROOT: {REPO_ROOT}")
+    print(f"DB_PATH: {db_path}")
+
+    if db_path.exists():
+        db_path.unlink()
+        print(f"REMOVED_DB: {db_path}")
+
+    if wal_path.exists():
+        wal_path.unlink()
+        print(f"REMOVED_WAL: {wal_path}")
 
 
 def _probe_required_tables() -> dict[str, dict[str, object]]:
     """
-    Probe required current tables after rebuild.
+    Probe the canonical tables that should exist after the rebuild.
 
-    Keep this list aligned with CURRENT jobs only.
+    This is intentionally narrow and uses only current table names.
     """
     from stock_quant_data.db.connections import connect_build_db
 
@@ -87,42 +98,32 @@ def _probe_required_tables() -> dict[str, dict[str, object]]:
         "symbol_reference_history",
     ]
 
-    conn = connect_build_db(read_only=True)
+    conn = connect_build_db()
     try:
-        result: dict[str, dict[str, object]] = {}
+        out: dict[str, dict[str, object]] = {}
         for table_name in required_tables:
-            fq_name = f"main.{table_name}"
-            exists = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM information_schema.tables
-                WHERE table_schema = 'main'
-                  AND table_name = ?
-                """,
-                [table_name],
-            ).fetchone()[0]
-
-            if not exists:
-                result[fq_name] = {"status": "missing"}
-                continue
-
-            count = conn.execute(f"SELECT COUNT(*) FROM {fq_name}").fetchone()[0]
-            result[fq_name] = {"status": "ok", "count": count}
-
-        return result
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                out[f"main.{table_name}"] = {"status": "ok", "count": count}
+            except Exception as exc:  # pragma: no cover - log-friendly path
+                out[f"main.{table_name}"] = {
+                    "status": "error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+        return out
     finally:
         conn.close()
 
 
 def main() -> None:
     """
-    Run the full current loader rebuild.
+    Execute the full canonical rebuild in a fixed order.
 
-    Notes:
-    - this script does NOT delete backups
-    - this script does NOT create backups
-    - it only orchestrates the current canonical jobs
+    Order matters because later jobs depend on tables materialized by
+    earlier jobs.
     """
+    _remove_existing_db_files()
+
     steps: list[tuple[str, str]] = [
         ("init_db", "stock_quant_data.jobs.init_db"),
         ("init_price_raw_tables", "stock_quant_data.jobs.init_price_raw_tables"),
@@ -151,15 +152,32 @@ def main() -> None:
         ("build_high_priority_unresolved_symbol_probe", "stock_quant_data.jobs.build_high_priority_unresolved_symbol_probe"),
     ]
 
-    print("===== REBUILD LOADER DB =====")
-    print(f"REPO_ROOT: {REPO_ROOT}")
+    summary: list[dict[str, str]] = []
 
-    results: list[dict[str, str]] = []
     for step_name, module_name in steps:
-        results.append(_run_step(step_name, module_name))
+        print(f"===== STEP: {step_name} =====")
+        try:
+            run_fn = _load_run(module_name)
+            run_fn()
+            summary.append(
+                {
+                    "name": step_name,
+                    "status": "ok",
+                    "detail": "completed",
+                }
+            )
+        except Exception as exc:  # pragma: no cover - log-first path
+            summary.append(
+                {
+                    "name": step_name,
+                    "status": "error",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            print(f"ERROR: {step_name} failed")
 
     print("===== FINAL STEP SUMMARY =====")
-    _print_json(results)
+    _print_json(summary)
 
     print("===== REQUIRED TABLE PROBE =====")
     _print_json(_probe_required_tables())

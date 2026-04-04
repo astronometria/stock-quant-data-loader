@@ -1,14 +1,13 @@
 """
-Build a broader symbol history layer from all loaded Nasdaq snapshots.
+Build broader symbol reference history from all loaded Nasdaq snapshots.
 
-Current canonical outputs modified:
-- instrument
-- symbol_reference_history
+This is the canonical snapshot-history reconstruction job for the CURRENT repo.
 
-Important:
-- unlike the latest-only job, this one builds coarse first/last seen intervals
-- it must use current schema names only
-- it must not insert extra demo rows that create collisions later
+Contract:
+- one symbol -> one instrument based on current primary_ticker model
+- open interval if symbol appears in latest snapshot
+- closed interval otherwise ending at last_seen_date
+- later enrichment jobs may back-extend or repair rows
 """
 
 from __future__ import annotations
@@ -23,8 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 def run() -> None:
     """
-    Rebuild instrument + symbol_reference_history from all available Nasdaq
-    snapshots using simple first-seen / last-seen interval logic.
+    Rebuild symbol_reference_history using all Nasdaq snapshots currently loaded.
     """
     configure_logging()
     LOGGER.info("build-symbol-reference-history-from-nasdaq-snapshots started")
@@ -33,13 +31,21 @@ def run() -> None:
     try:
         latest_snapshot_id_row = conn.execute(
             """
-            SELECT MAX(snapshot_id)
-            FROM nasdaq_symbol_directory_raw
+            SELECT snapshot_id
+            FROM (
+                SELECT
+                    snapshot_id,
+                    COUNT(*) AS row_count
+                FROM nasdaq_symbol_directory_raw
+                GROUP BY snapshot_id
+            )
+            ORDER BY snapshot_id DESC
+            LIMIT 1
             """
         ).fetchone()
 
-        if latest_snapshot_id_row is None or latest_snapshot_id_row[0] is None:
-            raise RuntimeError("No Nasdaq Trader snapshots found in nasdaq_symbol_directory_raw")
+        if latest_snapshot_id_row is None:
+            raise RuntimeError("No Nasdaq snapshots found in nasdaq_symbol_directory_raw")
 
         latest_snapshot_id = latest_snapshot_id_row[0]
 
@@ -54,7 +60,8 @@ def run() -> None:
                     symbol,
                     security_name,
                     exchange_code,
-                    etf_flag
+                    etf_flag,
+                    source_kind
                 FROM nasdaq_symbol_directory_raw
                 WHERE symbol IS NOT NULL
                   AND symbol <> ''
@@ -79,19 +86,22 @@ def run() -> None:
                         PARTITION BY b.symbol
                         ORDER BY b.snapshot_date DESC, b.snapshot_id DESC
                     ) AS rn
-                FROM base AS b
+                FROM base b
             )
             SELECT
                 p.symbol,
                 p.first_seen_date,
                 p.last_seen_date,
                 p.seen_in_latest_snapshot,
+                a.security_name,
+                a.exchange_code,
+                a.etf_flag,
                 CASE
                     WHEN a.etf_flag = 'Y' THEN 'ETF'
-                    WHEN upper(COALESCE(a.security_name, '')) LIKE '%WARRANT%' THEN 'WARRANT'
-                    WHEN upper(COALESCE(a.security_name, '')) LIKE '%RIGHT%' THEN 'RIGHT'
-                    WHEN upper(COALESCE(a.security_name, '')) LIKE '%UNIT%' THEN 'UNIT'
-                    WHEN upper(COALESCE(a.security_name, '')) LIKE '%PREFERRED%' THEN 'PREFERRED_STOCK'
+                    WHEN upper(a.security_name) LIKE '%WARRANT%' THEN 'WARRANT'
+                    WHEN upper(a.security_name) LIKE '%RIGHT%' THEN 'RIGHT'
+                    WHEN upper(a.security_name) LIKE '%UNIT%' THEN 'UNIT'
+                    WHEN upper(a.security_name) LIKE '%PREFERRED%' THEN 'PREFERRED_STOCK'
                     ELSE 'COMMON_STOCK'
                 END AS security_type,
                 CASE
@@ -103,42 +113,46 @@ def run() -> None:
                     WHEN a.exchange_code = 'V' THEN 'IEX'
                     ELSE COALESCE(a.exchange_code, 'UNKNOWN')
                 END AS exchange_name
-            FROM per_symbol AS p
-            JOIN latest_attrs AS a
+            FROM per_symbol p
+            JOIN latest_attrs a
                 ON a.symbol = p.symbol
                AND a.rn = 1
             """,
             [latest_snapshot_id],
         )
 
-        # ------------------------------------------------------------------
-        # Rebuild instrument table from the broad history stage.
-        # ------------------------------------------------------------------
-        conn.execute("DELETE FROM instrument")
-        conn.execute(
-            """
-            INSERT INTO instrument (
-                instrument_id,
-                security_type,
-                company_id,
-                primary_ticker,
-                primary_exchange
+        # --------------------------------------------------------------
+        # Rebuild instrument only if currently empty.
+        # We do not want this history job to blow away instruments created
+        # by other valid identity-enrichment jobs.
+        # --------------------------------------------------------------
+        instrument_count_before = conn.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
+        if instrument_count_before == 0:
+            conn.execute(
+                """
+                INSERT INTO instrument (
+                    instrument_id,
+                    security_type,
+                    company_id,
+                    primary_ticker,
+                    primary_exchange
+                )
+                SELECT
+                    1000 + ROW_NUMBER() OVER (ORDER BY symbol) AS instrument_id,
+                    security_type,
+                    'NASDAQTRADER_' || symbol AS company_id,
+                    symbol AS primary_ticker,
+                    exchange_name AS primary_exchange
+                FROM tmp_nasdaq_symbol_history_stage
+                """
             )
-            SELECT
-                1000 + ROW_NUMBER() OVER (ORDER BY symbol) AS instrument_id,
-                security_type,
-                'NASDAQTRADER_' || symbol AS company_id,
-                symbol AS primary_ticker,
-                exchange_name AS primary_exchange
-            FROM tmp_nasdaq_symbol_history_stage
-            ORDER BY symbol
-            """
-        )
 
-        # ------------------------------------------------------------------
-        # Rebuild history intervals.
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Rebuild symbol_reference_history from snapshot history.
+        # This becomes the canonical baseline interval layer.
+        # --------------------------------------------------------------
         conn.execute("DELETE FROM symbol_reference_history")
+
         conn.execute(
             """
             INSERT INTO symbol_reference_history (
@@ -161,27 +175,15 @@ def run() -> None:
                     WHEN s.seen_in_latest_snapshot = 1 THEN NULL
                     ELSE s.last_seen_date
                 END AS effective_to
-            FROM tmp_nasdaq_symbol_history_stage AS s
-            JOIN instrument AS i
+            FROM tmp_nasdaq_symbol_history_stage s
+            JOIN instrument i
                 ON i.primary_ticker = s.symbol
-            ORDER BY s.symbol
             """
         )
 
-        instrument_count = conn.execute(
-            "SELECT COUNT(*) FROM instrument"
-        ).fetchone()[0]
-
-        symbol_reference_history_count = conn.execute(
+        instrument_count = conn.execute("SELECT COUNT(*) FROM instrument").fetchone()[0]
+        symbol_reference_count = conn.execute(
             "SELECT COUNT(*) FROM symbol_reference_history"
-        ).fetchone()[0]
-
-        closed_interval_count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM symbol_reference_history
-            WHERE effective_to IS NOT NULL
-            """
         ).fetchone()[0]
 
         print(
@@ -190,8 +192,7 @@ def run() -> None:
                 "job": "build-symbol-reference-history-from-nasdaq-snapshots",
                 "latest_snapshot_id": latest_snapshot_id,
                 "instrument_count": instrument_count,
-                "symbol_reference_history_count": symbol_reference_history_count,
-                "closed_interval_count": closed_interval_count,
+                "symbol_reference_history_count": symbol_reference_count,
             }
         )
     finally:

@@ -6,7 +6,7 @@ Canonical behavior:
   in instrument.primary_ticker
 - only create an open-ended symbol_reference_history row when that open symbol
   does not already exist
-- use only current canonical table/column names
+- deduplicate mapped_symbol values from the manual map before inserting
 """
 
 from __future__ import annotations
@@ -26,16 +26,29 @@ def run() -> None:
 
     conn = connect_build_db()
     try:
+        conn.execute("DROP TABLE IF EXISTS tmp_manual_distinct_symbols")
+        conn.execute(
+            """
+            CREATE TEMP TABLE tmp_manual_distinct_symbols AS
+            SELECT DISTINCT
+                mapped_symbol,
+                'UNKNOWN' AS exchange_name
+            FROM symbol_manual_override_map
+            WHERE mapped_symbol IS NOT NULL
+              AND TRIM(mapped_symbol) <> ''
+            """
+        )
+
         conn.execute("DROP TABLE IF EXISTS tmp_manual_missing_symbols")
         conn.execute(
             """
             CREATE TEMP TABLE tmp_manual_missing_symbols AS
             SELECT
-                m.mapped_symbol,
-                'UNKNOWN' AS exchange_name
-            FROM symbol_manual_override_map m
+                d.mapped_symbol,
+                d.exchange_name
+            FROM tmp_manual_distinct_symbols d
             LEFT JOIN instrument i
-              ON i.primary_ticker = m.mapped_symbol
+              ON i.primary_ticker = d.mapped_symbol
             WHERE i.instrument_id IS NULL
             """
         )
@@ -76,13 +89,13 @@ def run() -> None:
             CREATE TEMP TABLE tmp_manual_missing_open_refs AS
             SELECT
                 i.instrument_id,
-                m.mapped_symbol,
-                'UNKNOWN' AS exchange_name
-            FROM symbol_manual_override_map m
+                d.mapped_symbol,
+                d.exchange_name
+            FROM tmp_manual_distinct_symbols d
             JOIN instrument i
-              ON i.primary_ticker = m.mapped_symbol
+              ON i.primary_ticker = d.mapped_symbol
             LEFT JOIN symbol_reference_history srh
-              ON srh.symbol = m.mapped_symbol
+              ON srh.symbol = d.mapped_symbol
              AND srh.effective_to IS NULL
             WHERE srh.symbol IS NULL
             """

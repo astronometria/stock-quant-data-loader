@@ -1,11 +1,10 @@
 """
-Load Stooq daily raw prices from disk into the canonical raw table.
+Load raw Stooq daily files from disk into price_source_daily_raw_stooq.
 
-Current canonical target:
-- price_source_daily_raw_stooq
-
-The loader expects a local disk mirror already available. This repo should not
-perform external downloading here.
+Supported source roots:
+- downloader/data/prices/stooq/daily/us
+- local data/stooq
+- legacy ~/stock-quant-oop-raw/data/raw/stooq
 """
 
 from __future__ import annotations
@@ -23,32 +22,39 @@ from stock_quant_data.db.connections import connect_build_db
 LOGGER = logging.getLogger(__name__)
 
 
-def _find_stooq_csv_files(root: Path) -> list[Path]:
-    """
-    Find all csv files under the local stooq mirror.
-    """
-    files = sorted(root.rglob("*.csv"))
-    if not files:
-        raise FileNotFoundError(f"No Stooq CSV files found under {root}")
-    return files
+def _discover_stooq_files() -> tuple[Path, list[Path]]:
+    settings = get_settings()
+
+    candidate_roots = [
+        Path(settings.downloader_data_dir) / "prices" / "stooq" / "daily" / "us",
+        Path(settings.data_root) / "stooq",
+        Path.home() / "stock-quant-oop-raw" / "data" / "raw" / "stooq",
+    ]
+
+    for root in candidate_roots:
+        if not root.exists():
+            continue
+
+        files = sorted(root.rglob("*.txt")) + sorted(root.rglob("*.csv"))
+        if files:
+            return root, files
+
+    searched = ", ".join(str(p) for p in candidate_roots)
+    raise FileNotFoundError(f"No Stooq CSV files found under any candidate root: {searched}")
+
+
+def _row_value(row: dict, *names: str):
+    for name in names:
+        if name in row and row[name] not in (None, ""):
+            return row[name]
+    return None
 
 
 def run() -> None:
-    """
-    Load Stooq raw daily price rows into price_source_daily_raw_stooq.
-    """
     configure_logging()
     LOGGER.info("load-price-source-daily-raw-stooq-from-disk started")
 
-    settings = get_settings()
-
-    # Prefer colocated local raw mirror if configured under current repo data.
-    stooq_root = Path(settings.data_root) / "stooq"
-    if not stooq_root.exists():
-        # Fallback to a common sibling runtime/raw location pattern.
-        stooq_root = Path.home() / "stock-quant-oop-raw" / "data" / "raw" / "stooq"
-
-    csv_files = _find_stooq_csv_files(stooq_root)
+    source_root, files = _discover_stooq_files()
 
     conn = connect_build_db()
     try:
@@ -57,26 +63,23 @@ def run() -> None:
         rows: list[tuple] = []
         raw_price_id = 0
 
-        for csv_path in tqdm(csv_files, desc="stooq_csv_files", unit="file"):
-            with csv_path.open("r", encoding="utf-8", newline="") as fh:
-                reader = csv.DictReader(fh)
-
+        for file_path in tqdm(files, desc="stooq_raw_files", unit="file"):
+            delimiter = "," if file_path.suffix.lower() == ".csv" else ","
+            with file_path.open("r", encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh, delimiter=delimiter)
                 for row in reader:
                     raw_symbol = (
-                        row.get("symbol")
-                        or row.get("Symbol")
-                        or csv_path.stem.upper()
+                        _row_value(row, "symbol", "Symbol")
+                        or file_path.stem.split(".")[0]
                     )
+                    price_date = _row_value(row, "date", "Date")
+                    open_ = _row_value(row, "open", "Open")
+                    high = _row_value(row, "high", "High")
+                    low = _row_value(row, "low", "Low")
+                    close = _row_value(row, "close", "Close")
+                    volume = _row_value(row, "volume", "Volume")
 
-                    price_date = row.get("date") or row.get("Date")
-                    open_ = row.get("open") or row.get("Open")
-                    high = row.get("high") or row.get("High")
-                    low = row.get("low") or row.get("Low")
-                    close = row.get("close") or row.get("Close")
-                    volume = row.get("volume") or row.get("Volume") or 0
-
-                    # Skip obviously malformed rows cleanly.
-                    if not raw_symbol or not price_date or open_ in (None, "") or high in (None, "") or low in (None, "") or close in (None, ""):
+                    if not raw_symbol or not price_date:
                         continue
 
                     raw_price_id += 1
@@ -85,11 +88,12 @@ def run() -> None:
                             raw_price_id,
                             raw_symbol,
                             price_date,
-                            float(open_),
-                            float(high),
-                            float(low),
-                            float(close),
-                            int(float(volume)),
+                            open_,
+                            high,
+                            low,
+                            close,
+                            volume,
+                            str(file_path),
                         )
                     )
 
@@ -104,23 +108,21 @@ def run() -> None:
                     high,
                     low,
                     close,
-                    volume
+                    volume,
+                    source_file_path
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
-
-        row_count = conn.execute(
-            "SELECT COUNT(*) FROM price_source_daily_raw_stooq"
-        ).fetchone()[0]
 
         print(
             {
                 "status": "ok",
                 "job": "load-price-source-daily-raw-stooq-from-disk",
-                "csv_file_count": len(csv_files),
-                "row_count": row_count,
+                "source_root": str(source_root),
+                "file_count": len(files),
+                "row_count": conn.execute("SELECT COUNT(*) FROM price_source_daily_raw_stooq").fetchone()[0],
             }
         )
     finally:

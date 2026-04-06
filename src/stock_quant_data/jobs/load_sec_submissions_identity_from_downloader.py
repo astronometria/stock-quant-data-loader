@@ -1,19 +1,16 @@
 """
 Load broad SEC submissions identity data from downloader artifacts.
 
-Current canonical outputs modified:
+Canonical outputs modified:
 - sec_submissions_company_raw
 - sec_symbol_company_map
 
-Important:
-- only current table names
-- raw_id generation is deterministic inside a fresh rebuild
-- loader reads zip produced by downloader repo, but does not assume old repo names
+The canonical raw company table stores the parsed top-level submission identity
+fields, while sec_symbol_company_map stores one row per ticker mapping.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import zipfile
@@ -29,9 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _latest_zip_path(root: Path) -> Path:
-    """
-    Resolve the latest submissions zip from the downloader mirror.
-    """
+    """Resolve the latest submissions zip from the downloader mirror."""
     candidates = sorted(root.glob("*.zip"))
     if not candidates:
         raise FileNotFoundError(f"No submissions zip found under {root}")
@@ -39,16 +34,12 @@ def _latest_zip_path(root: Path) -> Path:
 
 
 def run() -> None:
-    """
-    Load broad SEC submissions company raw rows and extracted symbol mappings.
-    """
+    """Load SEC submissions company rows and extracted symbol mappings."""
     configure_logging()
     LOGGER.info("load-sec-submissions-identity-from-downloader started")
 
     settings = get_settings()
-    submissions_root = Path(settings.data_root).parent / "stock-quant-data-downloader" / "data" / "sec" / "submissions"
-
-    # Fallback: local colocated data path inside current repo, if present.
+    submissions_root = Path(settings.downloader_data_dir) / "sec" / "submissions"
     if not submissions_root.exists():
         submissions_root = Path(settings.data_root) / "sec" / "submissions"
 
@@ -64,7 +55,7 @@ def run() -> None:
 
         with zipfile.ZipFile(latest_zip, "r") as zf:
             members = sorted(
-                [name for name in zf.namelist() if name.lower().endswith(".json")]
+                name for name in zf.namelist() if name.lower().endswith(".json")
             )
 
             raw_id = 0
@@ -73,30 +64,40 @@ def run() -> None:
                 raw_id += 1
 
                 cik = str(payload.get("cik", "")).strip()
-                company_name = payload.get("name", "")
+                name = payload.get("name", "")
+                tickers = payload.get("tickers") or []
+                exchanges = payload.get("exchanges") or []
 
                 raw_rows.append(
                     (
                         raw_id,
                         cik,
-                        company_name,
+                        payload.get("entityType", ""),
+                        payload.get("sic", ""),
+                        payload.get("sicDescription", ""),
+                        name,
+                        json.dumps(tickers, separators=(",", ":")),
+                        json.dumps(exchanges, separators=(",", ":")),
+                        payload.get("ein", ""),
+                        payload.get("description", ""),
+                        payload.get("website", ""),
+                        payload.get("investorWebsite", ""),
+                        payload.get("fiscalYearEnd", ""),
                         str(latest_zip),
                         member_name,
-                        json.dumps(payload, separators=(",", ":")),
                     )
                 )
 
-                tickers = payload.get("tickers") or []
-                exchanges = payload.get("exchanges") or []
-
                 for idx, symbol in enumerate(tickers):
+                    if not symbol:
+                        continue
                     exchange = exchanges[idx] if idx < len(exchanges) else None
                     symbol_rows.append(
                         (
                             raw_id,
                             cik,
-                            symbol,
-                            company_name,
+                            str(symbol).strip(),
+                            name,
                             exchange,
                             str(latest_zip),
                             member_name,
@@ -109,12 +110,21 @@ def run() -> None:
                 INSERT INTO sec_submissions_company_raw (
                     raw_id,
                     cik,
-                    company_name,
+                    entity_type,
+                    sic,
+                    sic_description,
+                    name,
+                    tickers_json,
+                    exchanges_json,
+                    ein,
+                    description,
+                    website,
+                    investor_website,
+                    fiscal_year_end,
                     source_zip_path,
-                    json_member_name,
-                    raw_json
+                    json_member_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 raw_rows,
             )
@@ -139,7 +149,6 @@ def run() -> None:
         company_row_count = conn.execute(
             "SELECT COUNT(*) FROM sec_submissions_company_raw"
         ).fetchone()[0]
-
         symbol_row_count = conn.execute(
             "SELECT COUNT(*) FROM sec_symbol_company_map"
         ).fetchone()[0]

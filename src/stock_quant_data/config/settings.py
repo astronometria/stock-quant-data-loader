@@ -4,7 +4,7 @@ Central application settings for stock-quant-data-loader.
 Design goals:
 - single current repo only
 - explicit canonical paths
-- no hidden legacy aliases
+- backward-compatible helper accessors for existing jobs
 - easy to audit
 """
 
@@ -38,25 +38,17 @@ class Settings(BaseSettings):
         default_factory=lambda: Path(__file__).resolve().parents[3]
     )
 
-    # ------------------------------------------------------------------
-    # Canonical data roots for the CURRENT loader repo.
-    # ------------------------------------------------------------------
+    # Canonical local paths owned by this repo.
     data_dir: Path | None = None
     build_dir: Path | None = None
     build_db_path: Path | None = None
 
-    # ------------------------------------------------------------------
-    # Optional cross-repo inputs.
-    # These point at the downloader repo outputs when the repos are checked
-    # out side-by-side under ~/stock-quant-data-*.
-    # ------------------------------------------------------------------
+    # Optional sibling downloader repo.
     downloader_repo_root: Path | None = None
     downloader_data_dir: Path | None = None
 
     def model_post_init(self, __context: object) -> None:
-        """
-        Fill derived paths after settings initialization.
-        """
+        """Fill derived paths after settings initialization."""
         if self.data_dir is None:
             self.data_dir = self.repo_root / "data"
 
@@ -72,14 +64,29 @@ class Settings(BaseSettings):
         if self.downloader_data_dir is None:
             self.downloader_data_dir = self.downloader_repo_root / "data"
 
-    def ensure_directories(self) -> None:
+    @property
+    def data_root(self) -> Path:
         """
-        Create only the directories owned by this repo.
+        Backward-compatible alias used by older jobs.
 
-        We intentionally do NOT create arbitrary downloader directories here.
+        Keep this property until every caller has been migrated to data_dir.
         """
+        return self.data_dir
+
+    def ensure_directories(self) -> None:
+        """Create only the directories owned by this repo."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()
+
+
+def get_settings() -> Settings:
+    """
+    Backward-compatible accessor expected by several jobs.
+
+    Returning the singleton keeps one consistent configuration object across
+    the process and avoids hidden divergence.
+    """
+    return settings

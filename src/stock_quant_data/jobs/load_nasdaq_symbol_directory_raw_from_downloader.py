@@ -1,16 +1,10 @@
 """
 Load Nasdaq symbol directory raw snapshots from downloader artifacts.
 
-Current canonical target:
-- nasdaq_symbol_directory_raw
-
-Expected downloader artifact shape:
-- one or more CSV files and/or zip payloads placed under the downloader repo
-  data mirror
-
-This loader stays intentionally tolerant:
-- it accepts .csv and .zip
-- for .zip it loads every .csv member found inside
+Supports:
+- downloader/data/nasdaq/symdir/*.txt
+- downloader/data/nasdaq/*.csv
+- downloader/data/nasdaq/*.zip
 """
 
 from __future__ import annotations
@@ -31,33 +25,45 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _candidate_paths(root: Path) -> list[Path]:
-    """
-    Return all loadable Nasdaq raw artifacts in stable sorted order.
-    """
-    candidates = sorted(root.glob("*.csv")) + sorted(root.glob("*.zip"))
+    candidates: list[Path] = []
+
+    # Current downloader layout
+    symdir_root = root / "symdir"
+    if symdir_root.exists():
+        candidates.extend(sorted(symdir_root.glob("*.txt")))
+
+    # Legacy/simple layouts
+    candidates.extend(sorted(root.glob("*.csv")))
+    candidates.extend(sorted(root.glob("*.zip")))
+
     if not candidates:
         raise FileNotFoundError(f"No Nasdaq symbol directory artifacts found under {root}")
     return candidates
 
 
 def _snapshot_id_from_name(path_name: str) -> str:
-    """
-    Derive a snapshot_id from filename.
-
-    We keep this simple and deterministic: the stem becomes the snapshot_id.
-    """
     return Path(path_name).stem
 
 
+def _iter_reader_rows(reader: csv.DictReader, desc: str):
+    for row in tqdm(list(reader), desc=desc, unit="row"):
+        yield row
+
+
+def _open_pipe_txt_as_reader(path: Path) -> csv.DictReader:
+    """
+    Nasdaq Trader txt files are pipe-delimited and often end with summary/footer rows.
+    """
+    fh = path.open("r", encoding="utf-8", newline="")
+    return csv.DictReader(fh, delimiter="|")
+
+
 def run() -> None:
-    """
-    Load raw Nasdaq symbol directory snapshot rows.
-    """
     configure_logging()
     LOGGER.info("load-nasdaq-symbol-directory-raw-from-downloader started")
 
     settings = get_settings()
-    downloader_root = Path(settings.data_root).parent / "stock-quant-data-downloader" / "data" / "nasdaq"
+    downloader_root = Path(settings.downloader_data_dir) / "nasdaq"
     if not downloader_root.exists():
         downloader_root = Path(settings.data_root) / "nasdaq"
 
@@ -71,10 +77,36 @@ def run() -> None:
         raw_id = 0
 
         for artifact_path in artifact_paths:
-            if artifact_path.suffix.lower() == ".csv":
+            suffix = artifact_path.suffix.lower()
+
+            if suffix == ".txt":
+                with artifact_path.open("r", encoding="utf-8", newline="") as fh:
+                    reader = csv.DictReader(fh, delimiter="|")
+                    for row in _iter_reader_rows(reader, f"nasdaq_txt:{artifact_path.name}"):
+                        symbol = (row.get("Symbol") or row.get("symbol") or "").strip()
+                        if not symbol or symbol.upper().startswith("FILE CREATION TIME") or symbol.upper() == "SYMBOL":
+                            continue
+                        if symbol.upper().startswith("TOTAL"):
+                            continue
+
+                        raw_id += 1
+                        rows.append(
+                            (
+                                raw_id,
+                                _snapshot_id_from_name(artifact_path.name),
+                                "nasdaq_txt",
+                                symbol,
+                                (row.get("Security Name") or row.get("security_name") or "").strip() or None,
+                                (row.get("Market Category") or row.get("exchange_code") or "").strip() or None,
+                                (row.get("ETF") or row.get("etf_flag") or "").strip() or None,
+                                (row.get("Test Issue") or row.get("test_issue_flag") or "").strip() or None,
+                            )
+                        )
+
+            elif suffix == ".csv":
                 with artifact_path.open("r", encoding="utf-8", newline="") as fh:
                     reader = csv.DictReader(fh)
-                    for row in tqdm(list(reader), desc=f"nasdaq_csv:{artifact_path.name}", unit="row"):
+                    for row in _iter_reader_rows(reader, f"nasdaq_csv:{artifact_path.name}"):
                         raw_id += 1
                         rows.append(
                             (
@@ -84,32 +116,35 @@ def run() -> None:
                                 row.get("symbol"),
                                 row.get("security_name") or row.get("Security Name"),
                                 row.get("exchange_code") or row.get("Market Category"),
-                                row.get("test_issue_flag") or row.get("Test Issue"),
                                 row.get("etf_flag") or row.get("ETF"),
-                                None,
-                                str(row),
+                                row.get("test_issue_flag") or row.get("Test Issue"),
                             )
                         )
 
-            elif artifact_path.suffix.lower() == ".zip":
+            elif suffix == ".zip":
                 with zipfile.ZipFile(artifact_path, "r") as zf:
-                    members = sorted([name for name in zf.namelist() if name.lower().endswith(".csv")])
+                    members = sorted(name for name in zf.namelist() if name.lower().endswith((".csv", ".txt")))
                     for member_name in members:
-                        reader = csv.DictReader(io.StringIO(zf.read(member_name).decode("utf-8")))
-                        for row in tqdm(list(reader), desc=f"nasdaq_zip:{Path(member_name).name}", unit="row"):
+                        member_bytes = zf.read(member_name).decode("utf-8")
+                        delimiter = "|" if member_name.lower().endswith(".txt") else ","
+                        reader = csv.DictReader(io.StringIO(member_bytes), delimiter=delimiter)
+
+                        for row in _iter_reader_rows(reader, f"nasdaq_zip:{Path(member_name).name}"):
+                            symbol = (row.get("symbol") or row.get("Symbol") or "").strip()
+                            if delimiter == "|" and (not symbol or symbol.upper().startswith("TOTAL")):
+                                continue
+
                             raw_id += 1
                             rows.append(
                                 (
                                     raw_id,
                                     _snapshot_id_from_name(artifact_path.name),
-                                    row.get("source_kind", Path(member_name).stem),
-                                    row.get("symbol"),
+                                    Path(member_name).stem,
+                                    symbol or None,
                                     row.get("security_name") or row.get("Security Name"),
                                     row.get("exchange_code") or row.get("Market Category"),
-                                    row.get("test_issue_flag") or row.get("Test Issue"),
                                     row.get("etf_flag") or row.get("ETF"),
-                                    None,
-                                    str(row),
+                                    row.get("test_issue_flag") or row.get("Test Issue"),
                                 )
                             )
 
@@ -123,26 +158,21 @@ def run() -> None:
                     symbol,
                     security_name,
                     exchange_code,
-                    test_issue_flag,
                     etf_flag,
-                    round_lot_size,
-                    raw_payload_json
+                    test_issue_flag
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
-
-        row_count = conn.execute(
-            "SELECT COUNT(*) FROM nasdaq_symbol_directory_raw"
-        ).fetchone()[0]
 
         print(
             {
                 "status": "ok",
                 "job": "load-nasdaq-symbol-directory-raw-from-downloader",
                 "artifact_count": len(artifact_paths),
-                "row_count": row_count,
+                "row_count": conn.execute("SELECT COUNT(*) FROM nasdaq_symbol_directory_raw").fetchone()[0],
+                "downloader_root": str(downloader_root),
             }
         )
     finally:

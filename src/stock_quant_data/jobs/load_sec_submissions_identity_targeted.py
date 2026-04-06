@@ -1,11 +1,10 @@
 """
 Build the targeted SEC submissions identity layer from the current worklist.
 
-This module reads from the canonical full SEC submissions raw table and writes
-only to the canonical targeted table:
-- sec_submissions_company_raw_targeted
-
-It does not use any legacy or alternate table names.
+This module materializes the subset of broad SEC company rows associated with
+symbols appearing in the unresolved_symbol_worklist, using sec_symbol_company_map
+as the bridge because sec_submissions_company_raw itself does not contain a
+direct symbol column in the current canonical schema.
 """
 
 from __future__ import annotations
@@ -19,19 +18,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run() -> None:
-    """
-    Materialize a targeted subset of SEC submissions identity rows.
-
-    Matching strategy:
-    - take symbols from unresolved_symbol_worklist
-    - keep only SEC raw rows whose symbol matches the worklist symbol
-    """
+    """Materialize a targeted subset of SEC submissions identity rows."""
     configure_logging()
     LOGGER.info("load-sec-submissions-identity-targeted started")
 
     conn = connect_build_db()
     try:
-        # Ensure the canonical targeted table exists.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sec_submissions_company_raw_targeted AS
@@ -46,10 +38,12 @@ def run() -> None:
         conn.execute(
             """
             INSERT INTO sec_submissions_company_raw_targeted
-            SELECT raw.*
+            SELECT DISTINCT raw.*
             FROM sec_submissions_company_raw raw
+            JOIN sec_symbol_company_map map
+              ON map.cik = raw.cik
             JOIN unresolved_symbol_worklist work
-              ON raw.symbol = work.raw_symbol
+              ON map.symbol = work.raw_symbol
             """
         )
 
@@ -76,8 +70,12 @@ def run() -> None:
 
         symbol_row_count = conn.execute(
             """
-            SELECT COUNT(DISTINCT symbol)
-            FROM sec_submissions_company_raw_targeted
+            SELECT COUNT(DISTINCT map.symbol)
+            FROM sec_submissions_company_raw_targeted raw
+            JOIN sec_symbol_company_map map
+              ON map.cik = raw.cik
+            JOIN unresolved_symbol_worklist work
+              ON map.symbol = work.raw_symbol
             """
         ).fetchone()[0]
 

@@ -1,14 +1,19 @@
 """
 Build canonical normalized price rows from the raw price layer.
 
-This job only uses:
+This job uses:
 - price_source_daily_raw_stooq
-- price_source_daily_raw_yahoo
 - symbol_reference_history
 - stooq_symbol_normalization_map
 
 Output:
 - price_source_daily_normalized
+
+Important schema notes:
+- current raw Stooq table uses raw_price_id and raw_symbol
+- current raw Stooq table does not contain adj_close
+- current normalized table does contain adj_close, so we populate it with close
+  for Stooq until a true adjusted source is introduced
 """
 
 from __future__ import annotations
@@ -23,28 +28,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 def run() -> None:
-    """
-    Rebuild the canonical normalized price table.
-
-    Matching order for Stooq rows:
-    1) exact raw_symbol -> open symbol_reference_history symbol
-    2) mapped normalized_symbol via stooq_symbol_normalization_map -> open symbol_reference_history symbol
-
-    A row is RESOLVED only when an instrument_id is found.
-    """
+    """Rebuild the canonical normalized price table."""
     configure_logging()
     LOGGER.info("build-price-normalized-from-raw started")
 
-    # Keep the target table present even if this job is invoked alone.
     run_init_price_raw_tables()
 
     conn = connect_build_db()
     try:
         conn.execute("DELETE FROM price_source_daily_normalized")
 
-        # --------------------------------------------------------------
-        # Canonical Stooq normalization pipeline.
-        # --------------------------------------------------------------
         conn.execute(
             """
             INSERT INTO price_source_daily_normalized (
@@ -73,14 +66,14 @@ def run() -> None:
             ),
             stooq_base AS (
                 SELECT
-                    r.raw_id AS source_row_id,
-                    r.symbol AS raw_symbol,
+                    r.raw_price_id AS source_row_id,
+                    r.raw_symbol AS raw_symbol,
                     r.price_date,
                     r.open,
                     r.high,
                     r.low,
                     r.close,
-                    r.adj_close,
+                    r.close AS adj_close,
                     r.volume,
                     exact.instrument_id AS exact_instrument_id,
                     map.normalized_symbol,
@@ -88,9 +81,9 @@ def run() -> None:
                     map.rule_name
                 FROM price_source_daily_raw_stooq r
                 LEFT JOIN open_refs exact
-                  ON exact.symbol = r.symbol
+                  ON exact.symbol = r.raw_symbol
                 LEFT JOIN stooq_symbol_normalization_map map
-                  ON map.raw_symbol = r.symbol
+                  ON map.raw_symbol = r.raw_symbol
                 LEFT JOIN open_refs mapped
                   ON mapped.symbol = map.normalized_symbol
             ),

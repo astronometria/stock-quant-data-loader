@@ -1,14 +1,17 @@
 """
-Build listing_status_history from the canonical symbol identity layer.
+Build listing_status_history from the canonical identity layer.
 
 Design goals:
-- use symbol_reference_history as the primary identity history source
-- keep closed symbol reference intervals as the only direct INACTIVE source
-- use the latest complete Nasdaq snapshot day only as confirmation for open refs
-- do not force-close open refs merely because they are absent from the latest snapshot
-- classify non-confirmed open refs into more useful reason buckets
-- suppress obvious very-recent snapshot artifacts/test symbols only when they have
-  no resolved price coverage and no SEC identity support
+- use symbol_reference_history as the base history layer
+- keep closed symbol reference intervals as canonical INACTIVE rows
+- use the latest complete Nasdaq snapshot day only as a confirmation layer
+  for open symbols
+- do not forcibly close open refs merely because the latest snapshot does
+  not confirm them
+- suppress only obvious recent snapshot artifacts / test symbols that have:
+  - no latest snapshot confirmation
+  - no resolved price coverage
+  - no SEC identity support
 """
 
 from __future__ import annotations
@@ -47,8 +50,8 @@ def run() -> None:
                     CAST(substr(snapshot_id, 1, 10) AS DATE) AS snapshot_day,
                     COUNT(
                         DISTINCT CASE
-                            WHEN lower(snapshot_id) LIKE %nasdaqlisted% THEN nasdaqlisted
-                            WHEN lower(snapshot_id) LIKE %otherlisted% THEN otherlisted
+                            WHEN lower(snapshot_id) LIKE '%nasdaqlisted%' THEN 'nasdaqlisted'
+                            WHEN lower(snapshot_id) LIKE '%otherlisted%' THEN 'otherlisted'
                             ELSE NULL
                         END
                     ) AS file_family_count
@@ -81,8 +84,8 @@ def run() -> None:
             FROM nasdaq_symbol_directory_raw
             WHERE CAST(substr(snapshot_id, 1, 10) AS DATE) = ?
               AND symbol IS NOT NULL
-              AND trim(symbol) <> 
-              AND COALESCE(test_issue_flag, N) = N
+              AND trim(symbol) <> ''
+              AND COALESCE(test_issue_flag, 'N') = 'N'
             """,
             [latest_complete_snapshot_day],
         )
@@ -97,7 +100,7 @@ def run() -> None:
                 MAX(price_date) AS last_resolved_price_date,
                 COUNT(*) AS resolved_price_row_count
             FROM price_source_daily_normalized
-            WHERE upper(COALESCE(symbol_resolution_status, )) = RESOLVED
+            WHERE upper(COALESCE(symbol_resolution_status, '')) = 'RESOLVED'
               AND instrument_id IS NOT NULL
             GROUP BY instrument_id
             """
@@ -114,7 +117,7 @@ def run() -> None:
                 SELECT symbol FROM sec_symbol_company_map_targeted
             )
             WHERE symbol IS NOT NULL
-              AND trim(symbol) <> 
+              AND trim(symbol) <> ''
             """
         )
 
@@ -143,21 +146,22 @@ def run() -> None:
             WHERE latest.symbol IS NULL
               AND rpc.instrument_id IS NULL
               AND sec.symbol IS NULL
-              AND o.effective_from >= DATE 2026-03-29
+              AND o.effective_from >= ?
               AND (
-                    upper(o.symbol) LIKE %TEST%
-                 OR upper(o.symbol) LIKE ZTEST%
-                 OR upper(o.symbol) LIKE ATEST%
-                 OR upper(o.symbol) LIKE CTEST%
-                 OR upper(o.symbol) LIKE MTEST%
-                 OR upper(o.symbol) LIKE NTEST%
-                 OR upper(o.symbol) LIKE ZEXIT%
-                 OR upper(o.symbol) LIKE ZIEXT%
-                 OR upper(o.symbol) LIKE ZXIET%
-                 OR upper(o.symbol) LIKE ZBZX%
-                 OR upper(o.symbol) LIKE ZVV%
+                    upper(o.symbol) LIKE '%TEST%'
+                 OR upper(o.symbol) LIKE 'ZTEST%'
+                 OR upper(o.symbol) LIKE 'ATEST%'
+                 OR upper(o.symbol) LIKE 'CTEST%'
+                 OR upper(o.symbol) LIKE 'MTEST%'
+                 OR upper(o.symbol) LIKE 'NTEST%'
+                 OR upper(o.symbol) LIKE 'ZEXIT%'
+                 OR upper(o.symbol) LIKE 'ZIEXT%'
+                 OR upper(o.symbol) LIKE 'ZXIET%'
+                 OR upper(o.symbol) LIKE 'ZBZX%'
+                 OR upper(o.symbol) LIKE 'ZVV%'
               )
-            """
+            """,
+            [latest_complete_snapshot_day],
         )
 
         conn.execute(
@@ -172,64 +176,29 @@ def run() -> None:
                 effective_to,
                 source_name
             )
-            WITH params AS (
-                SELECT CAST(? AS DATE) AS latest_complete_snapshot_day
-            ),
-            base AS (
+            WITH base AS (
                 SELECT
                     srh.symbol_reference_history_id AS listing_status_history_id,
                     srh.instrument_id,
                     srh.symbol,
                     srh.effective_from,
                     srh.effective_to,
-                    i.security_type,
-                    i.primary_exchange,
-                    latest.symbol AS latest_confirmed_symbol
+                    CASE
+                        WHEN srh.effective_to IS NOT NULL THEN 'INACTIVE'
+                        ELSE 'ACTIVE'
+                    END AS listing_status,
+                    CASE
+                        WHEN srh.effective_to IS NOT NULL THEN 'closed_symbol_reference_interval'
+                        WHEN latest.symbol IS NOT NULL THEN 'present_in_latest_complete_nasdaq_snapshot_day'
+                        ELSE 'open_symbol_reference_not_confirmed_by_latest_complete_nasdaq_snapshot_day'
+                    END AS status_reason
                 FROM symbol_reference_history srh
-                LEFT JOIN instrument i
-                  ON i.instrument_id = srh.instrument_id
                 LEFT JOIN tmp_latest_complete_nasdaq_symbols latest
                   ON latest.symbol = upper(trim(srh.symbol))
                 LEFT JOIN tmp_recent_snapshot_artifact_symbols artifact
                   ON artifact.instrument_id = srh.instrument_id
                  AND artifact.symbol = srh.symbol
                 WHERE artifact.symbol IS NULL
-            ),
-            classified AS (
-                SELECT
-                    b.listing_status_history_id,
-                    b.instrument_id,
-                    b.symbol,
-                    b.effective_from,
-                    b.effective_to,
-                    CASE
-                        WHEN b.effective_to IS NOT NULL THEN INACTIVE
-                        ELSE ACTIVE
-                    END AS listing_status,
-                    CASE
-                        WHEN b.effective_to IS NOT NULL THEN closed_symbol_reference_interval
-                        WHEN b.latest_confirmed_symbol IS NOT NULL THEN present_in_latest_complete_nasdaq_snapshot_day
-                        WHEN upper(COALESCE(b.primary_exchange, )) = OTC
-                            THEN open_symbol_reference_otc_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                        WHEN upper(COALESCE(b.security_type, )) = ETF
-                            THEN open_symbol_reference_etf_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                        WHEN upper(b.symbol) LIKE %-WS
-                          OR upper(b.symbol) LIKE %WS
-                          OR upper(b.symbol) LIKE %-W
-                          OR upper(b.symbol) LIKE %-R
-                          OR upper(b.symbol) LIKE %RT
-                            THEN open_symbol_reference_warrant_or_right_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                        WHEN upper(b.symbol) LIKE %-U
-                          OR upper(b.symbol) LIKE %U
-                            THEN open_symbol_reference_unit_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                        WHEN b.symbol LIKE %-%
-                            THEN open_symbol_reference_class_or_series_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                        WHEN b.effective_from >= p.latest_complete_snapshot_day - INTERVAL 180 DAY
-                            THEN open_symbol_reference_recent_plain_symbol_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                        ELSE open_symbol_reference_long_lived_plain_symbol_not_confirmed_by_latest_complete_nasdaq_snapshot_day
-                    END AS status_reason
-                FROM base b
-                CROSS JOIN params p
             )
             SELECT
                 listing_status_history_id,
@@ -239,10 +208,9 @@ def run() -> None:
                 status_reason,
                 effective_from,
                 effective_to,
-                build-listing-status-history AS source_name
-            FROM classified
-            """,
-            [latest_complete_snapshot_day],
+                'build-listing-status-history' AS source_name
+            FROM base
+            """
         )
 
         listing_status_history_count = conn.execute(
@@ -279,11 +247,12 @@ def run() -> None:
             """
             SELECT
                 MIN(effective_from),
-                MAX(COALESCE(effective_to, DATE 2026-03-31)),
+                MAX(COALESCE(effective_to, ?)),
                 MIN(effective_from),
-                MAX(COALESCE(effective_to, DATE 2026-03-31))
+                MAX(COALESCE(effective_to, ?))
             FROM listing_status_history
-            """
+            """,
+            [latest_complete_snapshot_day, latest_complete_snapshot_day],
         ).fetchone()
 
         print(

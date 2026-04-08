@@ -14,6 +14,16 @@ Important schema notes:
 - current raw Stooq table does not contain adj_close
 - current normalized table does contain adj_close, so we populate it with close
   for Stooq until a true adjusted source is introduced
+
+Resolution strategy:
+1) Direct exact match on raw_symbol against currently open symbol references
+2) Generic Stooq normalization:
+   - uppercase
+   - trim
+   - strip trailing .US
+   - replace underscore with dash
+   Then match against currently open symbol references
+3) Explicit normalization-map fallback for special symbols
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ def run() -> None:
 
     conn = connect_build_db()
     try:
+        # Rebuild from scratch for deterministic output.
         conn.execute("DELETE FROM price_source_daily_normalized")
 
         conn.execute(
@@ -59,6 +70,7 @@ def run() -> None:
             )
             WITH open_refs AS (
                 SELECT
+                    upper(trim(symbol)) AS normalized_open_symbol,
                     symbol,
                     instrument_id
                 FROM symbol_reference_history
@@ -75,17 +87,57 @@ def run() -> None:
                     r.close,
                     r.close AS adj_close,
                     r.volume,
+
+                    -- Exact raw match first. This can help if the raw symbol
+                    -- already matches the open symbol reference convention.
                     exact.instrument_id AS exact_instrument_id,
+
+                    -- Generic SQL-first normalization for native Stooq symbols.
+                    -- Examples:
+                    --   AAPL.US   -> AAPL
+                    --   ABR_D.US  -> ABR-D
+                    upper(
+                        replace(
+                            replace(trim(r.raw_symbol), '.US', ''),
+                            '_',
+                            '-'
+                        )
+                    ) AS normalized_probe_symbol,
+
+                    generic.instrument_id AS generic_instrument_id,
+
+                    -- Specialized fallback map for preferred / special series.
                     map.normalized_symbol,
+                    upper(
+                        replace(
+                            replace(trim(map.normalized_symbol), '.US', ''),
+                            '_',
+                            '-'
+                        )
+                    ) AS normalized_map_symbol,
                     mapped.instrument_id AS mapped_instrument_id,
                     map.rule_name
                 FROM price_source_daily_raw_stooq r
                 LEFT JOIN open_refs exact
-                  ON exact.symbol = r.raw_symbol
+                  ON exact.normalized_open_symbol = upper(trim(r.raw_symbol))
+                LEFT JOIN open_refs generic
+                  ON generic.normalized_open_symbol = upper(
+                        replace(
+                            replace(trim(r.raw_symbol), '.US', ''),
+                            '_',
+                            '-'
+                        )
+                     )
                 LEFT JOIN stooq_symbol_normalization_map map
                   ON map.raw_symbol = r.raw_symbol
                 LEFT JOIN open_refs mapped
-                  ON mapped.symbol = map.normalized_symbol
+                  ON mapped.normalized_open_symbol = upper(
+                        replace(
+                            replace(trim(map.normalized_symbol), '.US', ''),
+                            '_',
+                            '-'
+                        )
+                     )
             ),
             staged AS (
                 SELECT
@@ -93,7 +145,11 @@ def run() -> None:
                     'stooq' AS source_name,
                     source_row_id,
                     raw_symbol,
-                    COALESCE(exact_instrument_id, mapped_instrument_id) AS instrument_id,
+                    COALESCE(
+                        exact_instrument_id,
+                        generic_instrument_id,
+                        mapped_instrument_id
+                    ) AS instrument_id,
                     price_date,
                     open,
                     high,
@@ -102,13 +158,19 @@ def run() -> None:
                     adj_close,
                     volume,
                     CASE
-                        WHEN COALESCE(exact_instrument_id, mapped_instrument_id) IS NOT NULL
+                        WHEN COALESCE(
+                            exact_instrument_id,
+                            generic_instrument_id,
+                            mapped_instrument_id
+                        ) IS NOT NULL
                             THEN 'RESOLVED'
                         ELSE 'UNRESOLVED'
                     END AS symbol_resolution_status,
                     CASE
                         WHEN exact_instrument_id IS NOT NULL
                             THEN 'exact raw symbol matched open symbol reference'
+                        WHEN generic_instrument_id IS NOT NULL
+                            THEN 'generic stooq normalization matched open symbol reference'
                         WHEN mapped_instrument_id IS NOT NULL
                             THEN 'mapped via ' || COALESCE(rule_name, 'stooq_symbol_normalization_map')
                         ELSE 'no matching symbol mapping found'

@@ -1,17 +1,16 @@
 """
-Build listing_status_history from the canonical identity layer.
+Build listing_status_history from the current canonical identity layer.
 
 Design goals:
-- use symbol_reference_history as the base history layer
-- keep closed symbol reference intervals as canonical INACTIVE rows
-- use the latest complete Nasdaq snapshot day only as a confirmation layer
-  for open symbols
-- do not forcibly close open refs merely because the latest snapshot does
-  not confirm them
-- suppress only obvious recent snapshot artifacts / test symbols that have:
-  - no latest snapshot confirmation
-  - no resolved price coverage
-  - no SEC identity support
+- use symbol_reference_history as the base historical identity layer
+- closed symbol_reference_history intervals become INACTIVE rows
+- latest complete Nasdaq snapshot day is used only as a confirmation layer
+- open refs not confirmed by latest snapshot remain ACTIVE, but get a distinct reason
+- suppress obvious recent snapshot/test artifacts that have:
+  * no latest snapshot confirmation
+  * no resolved price coverage
+  * no SEC support
+- keep the logic explicit and auditable
 """
 
 from __future__ import annotations
@@ -31,6 +30,7 @@ def run() -> None:
 
     conn = connect_build_db()
     try:
+        # Basic required coverage probes so the job output is self-describing.
         required_counts = {
             "symbol_reference_history": conn.execute(
                 "SELECT COUNT(*) FROM symbol_reference_history"
@@ -43,6 +43,8 @@ def run() -> None:
             ).fetchone()[0],
         }
 
+        # Find the latest calendar day for which both nasdaqlisted + otherlisted
+        # were loaded. We only use complete days as confirmation layers.
         latest_complete_snapshot_day_row = conn.execute(
             """
             WITH snapshot_days AS (
@@ -73,8 +75,10 @@ def run() -> None:
 
         latest_complete_snapshot_day = latest_complete_snapshot_day_row[0]
 
+        # Rebuild target table deterministically from scratch.
         conn.execute("DELETE FROM listing_status_history")
 
+        # Latest complete snapshot symbols used only as current confirmation.
         conn.execute("DROP TABLE IF EXISTS tmp_latest_complete_nasdaq_symbols")
         conn.execute(
             """
@@ -90,6 +94,7 @@ def run() -> None:
             [latest_complete_snapshot_day],
         )
 
+        # Resolved price coverage helps detect obvious recent garbage artifacts.
         conn.execute("DROP TABLE IF EXISTS tmp_resolved_price_coverage_by_instrument")
         conn.execute(
             """
@@ -106,6 +111,7 @@ def run() -> None:
             """
         )
 
+        # SEC support is another guard against suppressing valid identities.
         conn.execute("DROP TABLE IF EXISTS tmp_sec_identity_symbols")
         conn.execute(
             """
@@ -121,6 +127,8 @@ def run() -> None:
             """
         )
 
+        # Suppress obvious recent snapshot/test artifacts only.
+        # We keep the rule intentionally narrow and conservative.
         conn.execute("DROP TABLE IF EXISTS tmp_recent_snapshot_artifact_symbols")
         conn.execute(
             """
@@ -138,15 +146,15 @@ def run() -> None:
                 o.symbol
             FROM open_refs o
             LEFT JOIN tmp_latest_complete_nasdaq_symbols latest
-              ON latest.symbol = upper(trim(o.symbol))
+                ON latest.symbol = upper(trim(o.symbol))
             LEFT JOIN tmp_resolved_price_coverage_by_instrument rpc
-              ON rpc.instrument_id = o.instrument_id
+                ON rpc.instrument_id = o.instrument_id
             LEFT JOIN tmp_sec_identity_symbols sec
-              ON sec.symbol = upper(trim(o.symbol))
+                ON sec.symbol = upper(trim(o.symbol))
             WHERE latest.symbol IS NULL
               AND rpc.instrument_id IS NULL
               AND sec.symbol IS NULL
-              AND o.effective_from >= ?
+              AND o.effective_from >= DATE '2026-03-29'
               AND (
                     upper(o.symbol) LIKE '%TEST%'
                  OR upper(o.symbol) LIKE 'ZTEST%'
@@ -160,10 +168,10 @@ def run() -> None:
                  OR upper(o.symbol) LIKE 'ZBZX%'
                  OR upper(o.symbol) LIKE 'ZVV%'
               )
-            """,
-            [latest_complete_snapshot_day],
+            """
         )
 
+        # Build final rows from the canonical symbol reference layer.
         conn.execute(
             """
             INSERT INTO listing_status_history (
@@ -194,10 +202,10 @@ def run() -> None:
                     END AS status_reason
                 FROM symbol_reference_history srh
                 LEFT JOIN tmp_latest_complete_nasdaq_symbols latest
-                  ON latest.symbol = upper(trim(srh.symbol))
+                    ON latest.symbol = upper(trim(srh.symbol))
                 LEFT JOIN tmp_recent_snapshot_artifact_symbols artifact
-                  ON artifact.instrument_id = srh.instrument_id
-                 AND artifact.symbol = srh.symbol
+                    ON artifact.instrument_id = srh.instrument_id
+                   AND artifact.symbol = srh.symbol
                 WHERE artifact.symbol IS NULL
             )
             SELECT
@@ -247,12 +255,11 @@ def run() -> None:
             """
             SELECT
                 MIN(effective_from),
-                MAX(COALESCE(effective_to, ?)),
+                MAX(COALESCE(effective_to, DATE '2026-03-31')),
                 MIN(effective_from),
-                MAX(COALESCE(effective_to, ?))
+                MAX(COALESCE(effective_to, DATE '2026-03-31'))
             FROM listing_status_history
-            """,
-            [latest_complete_snapshot_day, latest_complete_snapshot_day],
+            """
         ).fetchone()
 
         print(

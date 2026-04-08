@@ -1,53 +1,31 @@
-# stock-quant-data-loader
+# Documentation v3 — stock-quant-data-loader
 
-Repo de **construction** de la base de données marché.
+Cette v3 ajoute une couche d’audit technique plus exploitable pour travailler dans le repo sans se perdre.
 
-Ce repo est responsable de :
+## Ce que contient cette version
 
-- initialiser la build DB DuckDB
-- charger les tables raw locales produites par le downloader
-- construire les tables de référence (`instrument`, `symbol_reference_history`, `listing_status_history`)
-- construire les tables de normalisation prix
-- produire les tables de triage des symboles non résolus
-- construire la table canonique `price_history`
+- catalogue des jobs par famille
+- matrice job → entrées / sorties / dépendances
+- contrats de tables critiques
+- checklists de validation après exécution
+- backlog des zones encore à vérifier dans le code
+- guide de debug des erreurs déjà rencontrées
 
-Ce repo n'est **pas** responsable de :
+## Index
 
-- télécharger les fichiers source depuis internet
-- exposer une API HTTP
-- exécuter des backtests, labels ML, features de recherche ou portefeuille
+1. [01-bootstrap-install.md](01-bootstrap-install.md)
+2. [02-pipeline-operatoire.md](02-pipeline-operatoire.md)
+3. [03-architecture-uml.md](03-architecture-uml.md)
+4. [04-etat-reel-db.md](04-etat-reel-db.md)
+5. [05-catalogue-jobs-v3.md](05-catalogue-jobs-v3.md)
+6. [06-contrats-tables-critiques.md](06-contrats-tables-critiques.md)
+7. [07-matrice-jobs-dependances.md](07-matrice-jobs-dependances.md)
+8. [08-checklists-validation.md](08-checklists-validation.md)
+9. [09-debug-incidents-rencontres.md](09-debug-incidents-rencontres.md)
+10. [10-backlog-audit-code.md](10-backlog-audit-code.md)
 
-## Tables principales côté build
+## Niveau de confiance
 
-### Raw
-- `nasdaq_symbol_directory_raw`
-- `sec_companyfacts_raw`
-- `sec_submissions_company_raw`
-- `price_source_daily_raw_stooq`
-- `price_source_daily_raw_yahoo`
-
-### Référence / master data
-- `instrument`
-- `symbol_reference_history`
-- `listing_status_history`
-- `symbol_manual_override_map`
-- `stooq_symbol_normalization_map`
-
-### Triage / résolution
-- `price_source_daily_normalized`
-- `symbol_reference_candidates_from_unresolved_stooq`
-- `unresolved_symbol_worklist`
-- `high_priority_unresolved_symbol_probe`
-
-### Canonique
-- `price_history`
-
-## Runtime local
-- build DB : `data/build/market_build.duckdb`
-
-## Principes
-- SQL-first
-- point-in-time
-- pas de survivor bias
-- invariants explicites après les étapes critiques
-- séparation stricte entre downloader, loader et api
+- **Confirmé par runs / probes** : chiffres, tables, statuts, volumes, séquences exécutées
+- **Fortement probable** : patterns de code et conventions du repo
+- **À vérifier dans le code** : signatures exactes de certaines fonctions non relues ligne à ligne ici

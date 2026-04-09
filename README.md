@@ -1,70 +1,62 @@
 # stock-quant-data-loader
 
-Repo de chargement et reconstruction de la build DB pour le stack stock-quant-data.
+## What this repo is
 
-## Rôle du repo
+`stock-quant-data-loader` is the **loader / build-database** repository of the stock-quant-data stack.
 
-Ce repo est centré sur la couche **loader / build database**.
+Its role is to:
 
-Il sert à :
+- initialize the local DuckDB build database
+- load and normalize raw market / identity datasets
+- maintain identity history
+- build listing status history
+- build research-ready universe membership history
 
-- initialiser la build DB DuckDB
-- charger et normaliser des données brutes déjà téléchargées
-- reconstruire les couches d'identité
-- construire les statuts de listing
-- construire les univers historiques
+## What this repo is not
 
-Ce repo n'est pas la couche API de serving finale.
+This repo is **not** the final serving API layer.
 
-## Point d'entrée canonique
+It is the **loader-side build system** that produces the canonical build DB used by downstream layers.
 
-Pour une reconstruction complète, utiliser :
+## Canonical entrypoint
 
-```bash
-python3 scripts/rebuild_loader_db.py
-```
-
-## Structure utile
-
-- `src/stock_quant_data/jobs/` : jobs unitaires
-- `src/stock_quant_data/cli/` : CLI du repo
-- `scripts/` : orchestration et outils
-- `data/build/market_build.duckdb` : build DB locale
-- `docs/` : documentation manuelle
-- `docs/auto_generated/` : inventaire technique généré
-
-## Documentation recommandée
-
-Lire dans cet ordre :
-
-1. `docs/11-runbook-canonique.md`
-2. `docs/12-runtime-paths-and-env.md`
-3. `docs/13-identity-status-universe-model.md`
-4. `docs/auto_generated/00-overview.md`
-
-## Commandes utiles
-
-### Vérifier l'environnement
-
-```bash
-python3 --version
-```
-
-### Lancer la reconstruction complète
+For a full rebuild, use:
 
 ```bash
 python3 scripts/rebuild_loader_db.py
 ```
 
-### Lancer un job isolé
+## Read the docs in this order
 
-```bash
-python3 -m stock_quant_data.jobs.build_listing_status_history
-python3 -m stock_quant_data.jobs.build_universe_membership_history_from_listing_status
+1. `docs/00-doc-map.md`
+2. `docs/11-runbook-canonique.md`
+3. `docs/12-runtime-paths-and-env.md`
+4. `docs/13-identity-status-universe-model.md`
+5. `docs/14-db-current-state.md`
+6. `docs/15-jobs-by-sequence.md`
+7. `docs/16-troubleshooting.md`
+
+## Important repo areas
+
+- `src/stock_quant_data/jobs/` — unit jobs
+- `src/stock_quant_data/cli/` — CLI layer
+- `scripts/` — orchestration and support scripts
+- `data/build/market_build.duckdb` — local build DB
+- `docs/` — curated documentation
+- `docs/auto_generated/` — generated inventory
+
+## Communication goal
+
+This repository should be understood as:
+
+```text
+raw / staged data
+    ->
+identity + normalization
+    ->
+listing status
+    ->
+universe membership
+    ->
+downstream consumers
 ```
-
-## Notes
-
-- la build DB est reconstruite de façon conservatrice
-- les couches identité / listing / univers sont séparées explicitement
-- la doc auto-générée sert d'inventaire, mais la doc manuelle décrit l'ordre d'utilisation réel

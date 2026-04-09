@@ -1,31 +1,70 @@
-# Documentation v3 — stock-quant-data-loader
+# stock-quant-data-loader
 
-Cette v3 ajoute une couche d’audit technique plus exploitable pour travailler dans le repo sans se perdre.
+Repo de chargement et reconstruction de la build DB pour le stack stock-quant-data.
 
-## Ce que contient cette version
+## Rôle du repo
 
-- catalogue des jobs par famille
-- matrice job → entrées / sorties / dépendances
-- contrats de tables critiques
-- checklists de validation après exécution
-- backlog des zones encore à vérifier dans le code
-- guide de debug des erreurs déjà rencontrées
+Ce repo est centré sur la couche **loader / build database**.
 
-## Index
+Il sert à :
 
-1. [01-bootstrap-install.md](01-bootstrap-install.md)
-2. [02-pipeline-operatoire.md](02-pipeline-operatoire.md)
-3. [03-architecture-uml.md](03-architecture-uml.md)
-4. [04-etat-reel-db.md](04-etat-reel-db.md)
-5. [05-catalogue-jobs-v3.md](05-catalogue-jobs-v3.md)
-6. [06-contrats-tables-critiques.md](06-contrats-tables-critiques.md)
-7. [07-matrice-jobs-dependances.md](07-matrice-jobs-dependances.md)
-8. [08-checklists-validation.md](08-checklists-validation.md)
-9. [09-debug-incidents-rencontres.md](09-debug-incidents-rencontres.md)
-10. [10-backlog-audit-code.md](10-backlog-audit-code.md)
+- initialiser la build DB DuckDB
+- charger et normaliser des données brutes déjà téléchargées
+- reconstruire les couches d'identité
+- construire les statuts de listing
+- construire les univers historiques
 
-## Niveau de confiance
+Ce repo n'est pas la couche API de serving finale.
 
-- **Confirmé par runs / probes** : chiffres, tables, statuts, volumes, séquences exécutées
-- **Fortement probable** : patterns de code et conventions du repo
-- **À vérifier dans le code** : signatures exactes de certaines fonctions non relues ligne à ligne ici
+## Point d'entrée canonique
+
+Pour une reconstruction complète, utiliser :
+
+```bash
+python3 scripts/rebuild_loader_db.py
+```
+
+## Structure utile
+
+- `src/stock_quant_data/jobs/` : jobs unitaires
+- `src/stock_quant_data/cli/` : CLI du repo
+- `scripts/` : orchestration et outils
+- `data/build/market_build.duckdb` : build DB locale
+- `docs/` : documentation manuelle
+- `docs/auto_generated/` : inventaire technique généré
+
+## Documentation recommandée
+
+Lire dans cet ordre :
+
+1. `docs/11-runbook-canonique.md`
+2. `docs/12-runtime-paths-and-env.md`
+3. `docs/13-identity-status-universe-model.md`
+4. `docs/auto_generated/00-overview.md`
+
+## Commandes utiles
+
+### Vérifier l'environnement
+
+```bash
+python3 --version
+```
+
+### Lancer la reconstruction complète
+
+```bash
+python3 scripts/rebuild_loader_db.py
+```
+
+### Lancer un job isolé
+
+```bash
+python3 -m stock_quant_data.jobs.build_listing_status_history
+python3 -m stock_quant_data.jobs.build_universe_membership_history_from_listing_status
+```
+
+## Notes
+
+- la build DB est reconstruite de façon conservatrice
+- les couches identité / listing / univers sont séparées explicitement
+- la doc auto-générée sert d'inventaire, mais la doc manuelle décrit l'ordre d'utilisation réel
